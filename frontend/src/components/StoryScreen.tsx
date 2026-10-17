@@ -46,7 +46,7 @@ export function StoryScreen() {
           </div>
         </div>
       </div>
-      {state.storyComplete && (
+      {state.phase === 'ended' && (
         <div className="bottom-banner">
           🎉 故事完成 — 点击「重新开始」体验新流程
         </div>

@@ -138,10 +138,10 @@ export function EventStream() {
           active={ev.id === activeId && ev.kind === 'npc_dialogue'}
         />
       ))}
-      {state.storyComplete && (
+      {state.phase === 'ended' && (
         <div className="story-end">
           <h3>🎉 故事完成</h3>
-          <p>你顺利度过了在英国的第一天。想再体验一次，可以点击右上角的「重新开始」。</p>
+          <p>你已经在这个世界安顿下来了。想再体验一次，可以点击右上角的「重新开始」。</p>
         </div>
       )}
     </div>

@@ -50,7 +50,7 @@ export function FeedbackPanel() {
 
       {open && (
         <div className="feedback-list">
-          {state.mode === 'challenge' && !state.storyComplete && (
+          {state.mode === 'challenge' && state.phase !== 'ended' && (
             <p className="challenge-hint">
               挑战模式中暂不显示逐条反馈，故事结束后可统一查看下方已记录的内容。
             </p>

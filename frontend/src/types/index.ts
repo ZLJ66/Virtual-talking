@@ -61,74 +61,13 @@ export interface ExpressionFeedback {
 }
 
 /* ----------------------------- 世界状态 ----------------------------- */
-
-export interface WorldState {
-  storyId: string
-  currentScene: string
-  currentNpc: string
-  inventory: string[]
-  questStatus: Record<string, string>
-  lastEvent: string
-}
-
-/* ----------------------------- 场景与节点（Mock 数据用） ----------------------------- */
-
-export interface StoryNode {
-  /** NPC 的旁白 */
-  narration: { zh: string; en: string }
-  /** NPC 台词 */
-  npc: {
-    speakerId: string
-    speakerName: string
-    content: string
-  }
-  /** 本节点是否完成本场景目标 */
-  completesScene?: boolean
-  /** 完成本节点后的世界状态变更 */
-  worldChanges?: {
-    addItem?: string
-    setQuest?: { id: string; status: string }
-    setNpc?: string
-  }
-}
-
-export interface SceneDef {
-  id: string
-  title: string
-  /** 场景开场描述（scene_intro 的 description） */
-  description: string
-  npcId: string
-  npcName: string
-  /** 场景开场旁白 */
-  openingNarration: { zh: string; en: string }
-  /** 场景开场 NPC 台词 */
-  openingDialogue: string
-  /** 按顺序推进的交互节点 */
-  nodes: StoryNode[]
-  /** 场景目标（用于提示） */
-  goal: string
-}
-
-export interface StoryDef {
-  id: string
-  title: string
-  scenes: SceneDef[]
-}
-
-/* ----------------------------- Mock 推演结果 ----------------------------- */
-
-export interface MockTurnResult {
-  /** 本回合生成的旁白 */
-  narration: { zh: string; en: string }
-  /** 本回合的 NPC 台词 */
-  npc: { speakerId: string; speakerName: string; content: string }
-  /** 本回合针对用户输入的英语反馈 */
-  feedback: ExpressionFeedback
-  /** 是否完成当前场景 */
-  completesScene: boolean
-  /** 世界状态变更 */
-  worldChanges?: StoryNode['worldChanges']
-}
+//
+// 阶段 A：旧的 WorldState（storyId/currentScene/questStatus）已被
+// types/world.ts 的 PlayerState 取代。进度不再由场景索引表达，
+// 而由 location + time + facts + npc_states 表达。
+//
+// 旧的 StoryNode / SceneDef / StoryDef / MockTurnResult 已随
+// data/mockStory.ts 一并删除——线性场景结构不兼容自由移动。
 
 /* ----------------------------- 运行期对话展示状态 ----------------------------- */
 

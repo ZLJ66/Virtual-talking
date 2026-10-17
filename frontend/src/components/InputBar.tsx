@@ -1,5 +1,5 @@
 // 双输入框：话语输入（英文）+ 动作输入（中/英）
-// 仅在 awaitingInput 且未完成场景时可用
+// 仅在 awaitingInput 时可用
 // AI 加载中禁用输入并显示等待提示
 
 import { useState } from 'react'
@@ -12,8 +12,6 @@ export function InputBar() {
 
   const blocked =
     !state.awaitingInput ||
-    state.sceneComplete ||
-    state.storyComplete ||
     state.dialogue.status === 'speaking' ||
     state.aiLoading
 

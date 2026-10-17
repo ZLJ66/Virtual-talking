@@ -1,7 +1,17 @@
-// 后端 API 调用层
+// 后端 AI API 调用层
 // 所有 AI 请求通过本地 FastAPI 后端代理，API 密钥不暴露给客户端
+//
+// 阶段 A 变更：请求参数由「场景卡」改为「世界状态 + 地点卡 + NPC 卡」，
+// 使 AI 能拿到真实的具体信息（感官细节、NPC 性格、印象标签），
+// 而非抽象的场景名——这是消除套路感的根本。
 
-import type { CharacterProfile, SceneDef, WorldState } from '../types'
+import type { CharacterProfile } from '../types'
+import type {
+  PlayerState,
+  WorldLocation,
+  WorldNPC,
+  WorldResponse,
+} from '../types/world'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -19,9 +29,11 @@ export interface AITurnResponse {
   } | null
   completes_scene: boolean
   world_changes: {
+    set_fact?: Record<string, boolean>
     add_item?: string
-    set_quest?: { id: string; status: string }
-    set_npc?: string
+    set_location?: string
+    set_time?: unknown
+    [key: string]: unknown
   }
 }
 
@@ -34,7 +46,18 @@ export interface AIOpeningResponse {
 }
 
 /** 构造对话历史（从事件列表提取最近几轮） */
-export function buildHistory(events: { kind: string; content?: string; speech?: string; zh?: string; en?: string }[]): { role: string; content: string }[] {
+export function buildHistory(
+  events: {
+    kind: string
+    content?: string
+    speech?: string
+    action?: string
+    zh?: string
+    en?: string
+    speakerName?: string
+    title?: string
+  }[],
+): { role: string; content: string }[] {
   const history: { role: string; content: string }[] = []
   for (const ev of events) {
     switch (ev.kind) {
@@ -45,66 +68,91 @@ export function buildHistory(events: { kind: string; content?: string; speech?: 
       case 'npc_dialogue':
         history.push({ role: 'npc', content: ev.content || '' })
         break
-      case 'player_input':
-        if (ev.speech) history.push({ role: 'player', content: ev.speech })
+      case 'player_input': {
+        const text = [ev.speech, ev.action].filter(Boolean).join(' / ')
+        if (text) history.push({ role: 'player', content: text })
+        break
+      }
+      case 'scene_intro':
+        history.push({ role: 'narration', content: `[到达 ${ev.title ?? ''}]` })
         break
     }
   }
-  // 最多保留最近 8 条
   return history.slice(-8)
 }
 
-/** 从 SceneDef 构造后端需要的场景对象 */
-export function sceneToAPIScene(scene: SceneDef) {
+/** 地点卡 → 后端需要的结构 */
+export function locationToAPI(loc: WorldLocation, slot?: string) {
   return {
-    title: scene.title,
-    description: scene.description,
-    goal: scene.goal,
-    location: scene.id === 'convenience_store' ? '英国街角便利店'
-      : scene.id === 'bus_stop' ? '英国街角公交站'
-      : scene.id === 'cafe' ? '英国校园旁咖啡馆'
-      : '英国',
-    npcs: [{
-      id: scene.npcId,
-      name: scene.npcName,
-      role: '',
-      personality: '',
-    }],
+    id: loc.id,
+    name: loc.name,
+    name_en: loc.name_en,
+    sensory: loc.sensory,
+    variant: slot ? ((loc.variants as Record<string, string>)[slot] ?? '') : '',
+    open_hours: loc.open_hours,
+    resident_npcs: loc.resident_npcs,
   }
 }
 
-/** 从 CharacterProfile 构造后端需要的 profile 对象 */
-export function profileToAPIProfile(profile: CharacterProfile) {
+/** NPC 卡 → 后端需要的结构（含印象标签与记忆） */
+export function npcToAPI(npc: WorldNPC | undefined, player: PlayerState | null) {
+  if (!npc) return null
+  const state = player?.npc_states?.[npc.id]
+  return {
+    id: npc.id,
+    name: npc.name,
+    role: npc.role,
+    age: npc.age,
+    background: npc.background,
+    personality: npc.personality,
+    speech: npc.speech,
+    impression_tags: state?.impression_tags ?? [],
+    memories: state?.memories ?? [],
+  }
+}
+
+/** 玩家档案 → 后端结构 */
+export function profileToAPI(profile: CharacterProfile) {
   return {
     englishLevel: profile.englishLevel,
     name: profile.name || undefined,
+    narrationLanguage: profile.narrationLanguage,
   }
 }
 
-/** 从 WorldState 构造后端需要的世界状态 */
-export function worldStateToAPI(ws: WorldState) {
+/** 世界状态 → 后端结构 */
+export function worldStateToAPI(player: PlayerState, world: WorldResponse) {
   return {
-    inventory: ws.inventory,
-    quests: Object.entries(ws.questStatus).map(([id, status]) => ({ id, status })),
-    npcStates: {},
+    location: player.location,
+    time: { day: player.time.day, slot: player.time.slot },
+    inventory: player.inventory,
+    facts: player.facts,
+    knowledge: player.knowledge,
+    world_title: world.world.title,
+    mainline_title: world.mainline.title,
+    deadline: world.mainline.deadline,
   }
 }
 
 /** 调用 /api/turn 生成一个回合 */
 export async function fetchTurn(
-  scene: SceneDef,
+  location: WorldLocation,
+  npc: WorldNPC | undefined,
   profile: CharacterProfile,
-  worldState: WorldState,
-  events: { kind: string; content?: string; speech?: string; zh?: string; en?: string }[],
+  player: PlayerState,
+  world: WorldResponse,
+  events: Parameters<typeof buildHistory>[0],
   playerInput: { speech: string; action: string },
 ): Promise<AITurnResponse> {
   const res = await fetch(`${API_BASE}/api/turn`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      scene: sceneToAPIScene(scene),
-      profile: profileToAPIProfile(profile),
-      world_state: worldStateToAPI(worldState),
+      location: locationToAPI(location, player.time.slot),
+      npc: npcToAPI(npc, player),
+      profile: profileToAPI(profile),
+      world_state: worldStateToAPI(player, world),
+      world_rules: world.world.rules,
       history: buildHistory(events),
       player_input: playerInput,
     }),
@@ -116,19 +164,25 @@ export async function fetchTurn(
   return res.json() as Promise<AITurnResponse>
 }
 
-/** 调用 /api/opening 生成场景开场 */
+/** 调用 /api/opening 生成地点开场 */
 export async function fetchOpening(
-  scene: SceneDef,
+  location: WorldLocation,
+  npc: WorldNPC | undefined,
   profile: CharacterProfile,
-  prevSceneSummary?: string,
+  player: PlayerState,
+  world: WorldResponse,
+  recentSummary: string,
 ): Promise<AIOpeningResponse> {
   const res = await fetch(`${API_BASE}/api/opening`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      scene: sceneToAPIScene(scene),
-      profile: profileToAPIProfile(profile),
-      prev_scene_summary: prevSceneSummary,
+      location: locationToAPI(location, player.time.slot),
+      npc: npcToAPI(npc, player),
+      profile: profileToAPI(profile),
+      world_state: worldStateToAPI(player, world),
+      world_rules: world.world.rules,
+      recent_summary: recentSummary,
     }),
   })
   if (!res.ok) {

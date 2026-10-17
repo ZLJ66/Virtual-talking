@@ -1,6 +1,14 @@
 // 游戏状态管理：useReducer + Context
-// 负责回合推进、打断/暂停/请求重复、场景切换、世界状态与反馈记录
-// 阶段2：AI 回合改为异步调用，loading/error 状态由 reducer 管理
+//
+// 阶段 A 重写：进度模型由「场景索引」改为「世界状态」。
+//   旧：sceneIndex / stepIndex（线性走廊，一个数字表达进度）
+//   新：location / time / facts / npc_states（自由移动，状态即进度）
+//
+// 保留不动的资产：
+//   · 事件流 GameEvent[]（唯一真相来源）
+//   · 打断 / 暂停 / 请求重复
+//   · 双语旁白与语言切换
+//   · 反馈记录
 
 import {
   createContext,
@@ -15,7 +23,7 @@ import {
 
 import { fetchTurn, fetchOpening } from '../api/ai'
 import type { AITurnResponse, AIOpeningResponse } from '../api/ai'
-import { mockGenerateTurn, nextId, story } from '../data/mockStory'
+import { fetchWorld, fetchMove, fetchWait } from '../api/world'
 import type {
   CharacterProfile,
   DialogueDisplay,
@@ -24,8 +32,13 @@ import type {
   GamePhase,
   NarrationLanguage,
   PracticeMode,
-  WorldState,
 } from '../types'
+import type {
+  MoveResult,
+  PlayerState,
+  WorldLocation,
+  WorldResponse,
+} from '../types/world'
 
 /* ----------------------------- State ----------------------------- */
 
@@ -34,18 +47,33 @@ export interface GameState {
   profile: CharacterProfile | null
   mode: PracticeMode
   narrationLang: NarrationLanguage
+
+  // ── 世界静态数据（从后端拉取一次）──
+  world: WorldResponse | null
+  worldLoading: boolean
+  worldError: string | null
+
+  // ── 玩家运行时状态（进度的唯一表达）──
+  player: PlayerState | null
+
+  // ── 事件流（唯一真相来源）──
   events: GameEvent[]
   feedbacks: ExpressionFeedback[]
-  worldState: WorldState | null
-  sceneIndex: number
-  stepIndex: number
+
+  // ── 对话展示 ──
   dialogue: DialogueDisplay
   awaitingInput: boolean
-  sceneComplete: boolean
-  storyComplete: boolean
-  // 异步 AI 调用状态
+
+  // ── 移动 / 等待 ──
+  moving: boolean
+  moveError: string | null
+
+  // ── AI 调用 ──
   aiLoading: boolean
   aiError: string | null
+
+  // ── 时间流逝叙述 ──
+  timeNarration: string
 }
 
 const initialState: GameState = {
@@ -53,17 +81,19 @@ const initialState: GameState = {
   profile: null,
   mode: 'immersive',
   narrationLang: 'both',
+  world: null,
+  worldLoading: false,
+  worldError: null,
+  player: null,
   events: [],
   feedbacks: [],
-  worldState: null,
-  sceneIndex: 0,
-  stepIndex: 0,
   dialogue: { eventId: null, status: 'idle', repeatToken: 0 },
   awaitingInput: false,
-  sceneComplete: false,
-  storyComplete: false,
+  moving: false,
+  moveError: null,
   aiLoading: false,
   aiError: null,
+  timeNarration: '',
 }
 
 /* ----------------------------- Actions ----------------------------- */
@@ -72,179 +102,129 @@ export type GameAction =
   | { type: 'SET_PROFILE'; profile: CharacterProfile }
   | { type: 'SET_MODE'; mode: PracticeMode }
   | { type: 'SET_NARRATION_LANG'; lang: NarrationLanguage }
+  | { type: 'WORLD_LOADING' }
+  | { type: 'WORLD_LOADED'; world: WorldResponse }
+  | { type: 'WORLD_ERROR'; error: string }
+  | { type: 'MOVE_START'; target: string }
+  | { type: 'MOVE_SUCCESS'; result: MoveResult; target: string }
+  | { type: 'MOVE_ERROR'; error: string }
+  | { type: 'WAIT_START' }
+  | { type: 'WAIT_SUCCESS'; result: MoveResult }
   | { type: 'SUBMIT_INPUT'; speech: string; action: string }
   | { type: 'AI_TURN_SUCCESS'; result: AITurnResponse }
   | { type: 'AI_TURN_ERROR'; error: string }
-  | { type: 'AI_OPENING_SUCCESS'; result: AIOpeningResponse; sceneIndex: number }
+  | { type: 'AI_OPENING_SUCCESS'; result: AIOpeningResponse; locationId: string }
   | { type: 'AI_OPENING_ERROR'; error: string }
   | { type: 'DIALOGUE_DONE' }
   | { type: 'INTERRUPT' }
   | { type: 'PAUSE' }
   | { type: 'RESUME' }
   | { type: 'REQUEST_REPEAT' }
-  | { type: 'ADVANCE_SCENE' }
   | { type: 'RESET' }
   | { type: 'CLEAR_ERROR' }
 
-/* ----------------------------- 辅助：进入场景（硬编码开场） ----------------------------- */
+/* ----------------------------- 辅助函数 ----------------------------- */
 
-function enterSceneHardcoded(state: GameState, sceneIndex: number): Partial<GameState> {
-  const scene = story.scenes[sceneIndex]
-  const introId = nextId('ev')
-  const narrationId = nextId('ev')
-  const dialogueId = nextId('ev')
+let idCounter = 0
+function nextId(prefix: string): string {
+  idCounter += 1
+  return `${prefix}-${Date.now().toString(36)}-${idCounter}`
+}
 
-  const newEvents: GameEvent[] = [
+/** 进入地点时追加的事件（不含 AI 生成部分） */
+function buildEnterEvents(
+  loc: WorldLocation,
+  timeNarration: string,
+  isFirstVisit: boolean,
+): GameEvent[] {
+  const events: GameEvent[] = [
     {
-      id: introId,
+      id: nextId('ev'),
       kind: 'scene_intro',
-      sceneId: scene.id,
-      title: scene.title,
-      description: scene.description,
-    },
-    { id: narrationId, kind: 'narration', zh: scene.openingNarration.zh, en: scene.openingNarration.en },
-    {
-      id: dialogueId,
-      kind: 'npc_dialogue',
-      sceneId: scene.id,
-      speakerId: scene.npcId,
-      speakerName: scene.npcName,
-      content: scene.openingDialogue,
+      sceneId: loc.id,
+      title: loc.name,
+      description: loc.name_en,
     },
   ]
 
-  const worldState: WorldState = state.worldState
-    ? {
-        ...state.worldState,
-        currentScene: scene.id,
-        currentNpc: scene.npcId,
-        lastEvent: `scene_${scene.id}_intro`,
-      }
-    : {
-        storyId: story.id,
-        currentScene: scene.id,
-        currentNpc: scene.npcId,
-        inventory: [],
-        questStatus: {},
-        lastEvent: `scene_${scene.id}_intro`,
-      }
-
-  return {
-    sceneIndex,
-    stepIndex: 0,
-    events: [...state.events, ...newEvents],
-    worldState,
-    dialogue: { eventId: dialogueId, status: 'speaking', repeatToken: 0 },
-    awaitingInput: false,
-    sceneComplete: false,
+  // 时间流逝叙述（设计文档 4.6：时间必须被叙述，而非 UI 数字跳变）
+  if (timeNarration) {
+    events.push({ id: nextId('ev'), kind: 'narration', zh: timeNarration, en: '' })
   }
+
+  // 首次进入时展示感官细节（生成层具体性的来源）
+  if (isFirstVisit && loc.sensory) {
+    const s = loc.sensory
+    events.push({
+      id: nextId('ev'),
+      kind: 'narration',
+      zh: `${s.sight}。${s.sound}。`,
+      en: '',
+    })
+  }
+
+  return events
 }
 
-/* ----------------------------- 辅助：AI 开场覆盖旁白+对话 ----------------------------- */
-
-function applyOpeningResult(
-  state: GameState,
-  sceneIndex: number,
-  result: AIOpeningResponse,
-): Partial<GameState> {
-  const scene = story.scenes[sceneIndex]
-  // 生成新的 NPC 对话事件 id，确保 DialogueBubble 重置打字进度
-  const newDialogueId = nextId('ev')
-  // 替换 narration 和 npc_dialogue 的内容；npc_dialogue 换新 id
-  const events = state.events.map((ev) => {
-    if (ev.kind === 'narration') {
-      return { ...ev, zh: result.narration.zh, en: result.narration.en }
-    }
-    if (ev.kind === 'npc_dialogue' && ev.sceneId === scene.id) {
-      return {
-        ...ev,
-        id: newDialogueId,
-        speakerId: result.npc.speaker_id || scene.npcId,
-        speakerName: result.npc.speaker_name || scene.npcName,
-        content: result.npc.content,
-      }
-    }
-    return ev
-  })
-
-  return {
-    events,
-    // 用新 id 重启打字机
-    dialogue: { eventId: newDialogueId, status: 'speaking', repeatToken: 0 },
-    aiLoading: false,
-    aiError: null,
-  }
+/** AI 返回的世界变更（宽松类型，逐项校验后才应用） */
+interface AIWorldChanges {
+  set_fact?: Record<string, boolean>
+  set_facts?: Record<string, boolean>
+  add_item?: string
+  set_location?: string
+  set_time?: unknown
+  [key: string]: unknown
 }
 
-/* ----------------------------- 辅助：应用 AI 回合结果 ----------------------------- */
+/**
+ * 应用 AI 提议的世界状态变更。
+ *
+ * **设计约束（世界层设计 5.6）：**
+ * AI 返回的 world_changes 只是「提议」，代码校验通过后才生效。
+ * 两条最重要的拒绝规则：
+ *   1. AI 不得移动玩家
+ *   2. AI 不得推进时间
+ */
+function applyWorldChanges(
+  player: PlayerState,
+  changes: AIWorldChanges,
+  world: WorldResponse | null,
+): PlayerState {
+  const next: PlayerState = {
+    ...player,
+    facts: { ...player.facts },
+    inventory: [...player.inventory],
+  }
 
-function applyTurnResult(state: GameState, result: AITurnResponse): Partial<GameState> {
-  const narrationEvent: GameEvent = {
-    id: nextId('ev'),
-    kind: 'narration',
-    zh: result.narration.zh,
-    en: result.narration.en,
-  }
-  const dialogueEvent: GameEvent = {
-    id: nextId('ev'),
-    kind: 'npc_dialogue',
-    speakerId: result.npc.speaker_id,
-    speakerName: result.npc.speaker_name,
-    content: result.npc.content,
+  // 明确拒绝：AI 不得移动玩家 / 推进时间
+  if ('set_location' in changes || 'set_time' in changes) {
+    console.warn('[world] 拒绝 AI 提议的移动或时间推进', {
+      set_location: changes.set_location,
+      set_time: changes.set_time,
+    })
   }
 
-  // 更新世界状态
-  const worldState: WorldState = { ...state.worldState! }
-  if (result.world_changes?.add_item) {
-    worldState.inventory = [...worldState.inventory, result.world_changes.add_item]
-  }
-  if (result.world_changes?.set_quest) {
-    worldState.questStatus = {
-      ...worldState.questStatus,
-      [result.world_changes.set_quest.id]: result.world_changes.set_quest.status,
+  // 事实变更：必须在白名单内
+  const factChanges = changes.set_fact ?? changes.set_facts
+  if (factChanges && world) {
+    const whitelist = new Set(Object.keys(world.facts))
+    for (const [key, value] of Object.entries(factChanges)) {
+      if (!whitelist.has(key)) {
+        console.warn(`[world] 拒绝未声明的事实: ${key}`)
+        continue
+      }
+      next.facts[key] = value
     }
   }
-  if (result.world_changes?.set_npc) {
-    worldState.currentNpc = result.world_changes.set_npc
-  }
-  worldState.lastEvent = `turn_${state.sceneIndex}_${state.stepIndex}`
 
-  // 构造反馈
-  const feedback: ExpressionFeedback = result.feedback
-    ? {
-        id: nextId('fb'),
-        userInput: '', // 由调用方填入
-        understood: result.feedback.understood,
-        naturalness: result.feedback.naturalness,
-        naturalnessNote: result.feedback.naturalness_note,
-        appropriateness: result.feedback.appropriateness,
-        appropriatenessNote: result.feedback.appropriateness_note,
-        suggestedExpression: result.feedback.suggested_expression || '',
-        suggestionReason: result.feedback.suggestion_reason || '',
-      }
-    : {
-        id: nextId('fb'),
-        userInput: '',
-        understood: true,
-        naturalness: 'good',
-        naturalnessNote: '',
-        appropriateness: 'good',
-        appropriatenessNote: '',
-        suggestedExpression: '',
-        suggestionReason: '',
-      }
-
-  return {
-    events: [...state.events, narrationEvent, dialogueEvent],
-    feedbacks: [...state.feedbacks, feedback],
-    worldState,
-    stepIndex: state.stepIndex + 1,
-    dialogue: { eventId: dialogueEvent.id, status: 'speaking', repeatToken: 0 },
-    awaitingInput: false,
-    sceneComplete: result.completes_scene,
-    aiLoading: false,
-    aiError: null,
+  // 物品
+  if (typeof changes.add_item === 'string' && changes.add_item) {
+    if (!next.inventory.includes(changes.add_item)) {
+      next.inventory.push(changes.add_item)
+    }
   }
+
+  return next
 }
 
 /* ----------------------------- Reducer ----------------------------- */
@@ -252,20 +232,18 @@ function applyTurnResult(state: GameState, result: AITurnResponse): Partial<Game
 function reducer(state: GameState, action: GameAction): GameState {
   switch (action.type) {
     case 'SET_PROFILE': {
-      const base: GameState = {
+      return {
         ...state,
         phase: 'story',
         profile: action.profile,
-        sceneIndex: 0,
-        stepIndex: 0,
         events: [],
         feedbacks: [],
-        worldState: null,
-        storyComplete: false,
-        aiLoading: true, // 等待 AI 开场
+        player: null,
+        worldError: null,
         aiError: null,
+        moveError: null,
+        timeNarration: '',
       }
-      return { ...base, ...enterSceneHardcoded(base, 0) }
     }
 
     case 'SET_MODE':
@@ -274,17 +252,109 @@ function reducer(state: GameState, action: GameAction): GameState {
     case 'SET_NARRATION_LANG':
       return { ...state, narrationLang: action.lang }
 
-    case 'SUBMIT_INPUT': {
-      if (state.phase !== 'story' || state.sceneComplete || state.aiLoading) return state
+    // ── 世界加载 ──
+    case 'WORLD_LOADING':
+      return { ...state, worldLoading: true, worldError: null }
 
-      // 先添加玩家输入事件
+    case 'WORLD_LOADED': {
+      const start = action.world.player_start
+      const startLoc = action.world.locations.find((l) => l.id === start.location)
+      const events = startLoc ? buildEnterEvents(startLoc, '', true) : []
+      return {
+        ...state,
+        worldLoading: false,
+        worldError: null,
+        world: action.world,
+        player: { ...start, visit_counts: { [start.location]: 1 } },
+        events,
+        aiLoading: true, // 等待 AI 生成开场
+      }
+    }
+
+    case 'WORLD_ERROR':
+      return { ...state, worldLoading: false, worldError: action.error }
+
+    // ── 移动 ──
+    case 'MOVE_START':
+      return { ...state, moving: true, moveError: null, awaitingInput: false }
+
+    case 'MOVE_SUCCESS': {
+      const r = action.result
+      if (!r.ok || !r.player_state || !r.location) {
+        return { ...state, moving: false, moveError: r.reason || '移动失败' }
+      }
+      const loc = r.location
+      const visits = r.player_state.visit_counts[action.target] ?? 1
+      const isFirstVisit = visits <= 1
+
+      // r.location 来自后端，字段与 WorldLocation 不完全一致（缺 variants/state_fields），
+      // 这里只取 buildEnterEvents 需要的字段构造一个最小对象
+      const enterLoc: WorldLocation = {
+        id: loc.id,
+        name: loc.name,
+        name_en: loc.name_en,
+        open_hours: [0, 24],
+        travel_cost: loc.travel_cost,
+        connections: loc.connections,
+        resident_npcs: loc.resident_npcs,
+        sensory: loc.sensory,
+        variants: {},
+        state_fields: {},
+      }
+
+      const newEvents = buildEnterEvents(enterLoc, r.time_narration, isFirstVisit)
+
+      return {
+        ...state,
+        moving: false,
+        moveError: null,
+        player: r.player_state,
+        events: [...state.events, ...newEvents],
+        timeNarration: r.time_narration,
+        dialogue: { eventId: null, status: 'idle', repeatToken: 0 },
+        awaitingInput: false,
+        // 第 4 次及以后进入不再调用 AI（成本控制，设计文档 5.5）
+        aiLoading: visits < 4,
+      }
+    }
+
+    case 'MOVE_ERROR':
+      return { ...state, moving: false, moveError: action.error }
+
+    // ── 等待 ──
+    case 'WAIT_START':
+      return { ...state, moving: true, moveError: null }
+
+    case 'WAIT_SUCCESS': {
+      const r = action.result
+      if (!r.ok || !r.player_state) {
+        return { ...state, moving: false, moveError: r.reason || '等待失败' }
+      }
+      const narrationEvent: GameEvent = {
+        id: nextId('ev'),
+        kind: 'narration',
+        zh: r.time_narration,
+        en: '',
+      }
+      return {
+        ...state,
+        moving: false,
+        player: r.player_state,
+        events: [...state.events, narrationEvent],
+        timeNarration: r.time_narration,
+        awaitingInput: true,
+      }
+    }
+
+    // ── 对话 ──
+    case 'SUBMIT_INPUT': {
+      if (state.phase !== 'story' || state.aiLoading) return state
       const playerEvent: GameEvent = {
         id: nextId('ev'),
         kind: 'player_input',
         speech: action.speech,
         action: action.action,
       }
-
       return {
         ...state,
         events: [...state.events, playerEvent],
@@ -295,84 +365,113 @@ function reducer(state: GameState, action: GameAction): GameState {
     }
 
     case 'AI_TURN_SUCCESS': {
-      // 把反馈关联到玩家输入
-      const result = applyTurnResult(state, action.result)
-      // 用玩家输入填充最新反馈的 userInput
-      const newFeedbacks = [...result.feedbacks!]
-      const lastPlayerEvent = [...state.events].reverse().find((e) => e.kind === 'player_input')
-      if (newFeedbacks.length > 0 && lastPlayerEvent) {
-        newFeedbacks[newFeedbacks.length - 1] = {
-          ...newFeedbacks[newFeedbacks.length - 1],
-          userInput: lastPlayerEvent.speech || lastPlayerEvent.action || '',
-        }
+      const result = action.result
+      const narrationEvent: GameEvent = {
+        id: nextId('ev'),
+        kind: 'narration',
+        zh: result.narration.zh,
+        en: result.narration.en,
       }
-      return { ...state, ...result, feedbacks: newFeedbacks }
+      const dialogueEvent: GameEvent = {
+        id: nextId('ev'),
+        kind: 'npc_dialogue',
+        speakerId: result.npc.speaker_id,
+        speakerName: result.npc.speaker_name,
+        content: result.npc.content,
+      }
+
+      const feedback: ExpressionFeedback = result.feedback
+        ? {
+            id: nextId('fb'),
+            userInput: '',
+            understood: result.feedback.understood,
+            naturalness: result.feedback.naturalness,
+            naturalnessNote: result.feedback.naturalness_note,
+            appropriateness: result.feedback.appropriateness,
+            appropriatenessNote: result.feedback.appropriateness_note,
+            suggestedExpression: result.feedback.suggested_expression || '',
+            suggestionReason: result.feedback.suggestion_reason || '',
+          }
+        : {
+            id: nextId('fb'),
+            userInput: '',
+            understood: true,
+            naturalness: 'good',
+            naturalnessNote: '',
+            appropriateness: 'good',
+            appropriatenessNote: '',
+            suggestedExpression: '',
+            suggestionReason: '',
+          }
+
+      // 用玩家输入填充反馈
+      const lastPlayer = [...state.events].reverse().find((e) => e.kind === 'player_input')
+      if (lastPlayer && lastPlayer.kind === 'player_input') {
+        feedback.userInput = lastPlayer.speech || lastPlayer.action || ''
+      }
+
+      // 世界状态变更由代码校验后应用
+      let player = state.player
+      if (player && result.world_changes) {
+        player = applyWorldChanges(player, result.world_changes, state.world)
+      }
+
+      return {
+        ...state,
+        events: [...state.events, narrationEvent, dialogueEvent],
+        feedbacks: [...state.feedbacks, feedback],
+        player,
+        dialogue: { eventId: dialogueEvent.id, status: 'speaking', repeatToken: 0 },
+        awaitingInput: false,
+        aiLoading: false,
+        aiError: null,
+      }
     }
 
-    case 'AI_TURN_ERROR': {
-      // 降级到 mock
-      const scene = story.scenes[state.sceneIndex]
-      if (!scene || !state.profile) {
-        return { ...state, aiLoading: false, aiError: action.error }
+    case 'AI_TURN_ERROR':
+      // 世界层下不降级到 mock（mock 数据已废弃），直接报错让用户重试
+      return {
+        ...state,
+        aiLoading: false,
+        aiError: `AI 调用失败: ${action.error}`,
+        awaitingInput: true,
       }
-      const lastPlayerEvent = [...state.events].reverse().find((e) => e.kind === 'player_input')
-      const speech = lastPlayerEvent?.speech || ''
-      const act = lastPlayerEvent?.action || ''
 
-      const mockResult = mockGenerateTurn(scene, state.stepIndex, speech, act, state.profile)
-      // 构造 AITurnResponse 格式的 fallback（snake_case 字段）
-      const fallback: AITurnResponse = {
-        narration: mockResult.narration,
-        npc: {
-          speaker_id: mockResult.npc.speakerId,
-          speaker_name: mockResult.npc.speakerName,
-          content: mockResult.npc.content,
-        },
-        feedback: {
-          understood: mockResult.feedback.understood,
-          naturalness: mockResult.feedback.naturalness,
-          naturalness_note: mockResult.feedback.naturalnessNote,
-          appropriateness: mockResult.feedback.appropriateness,
-          appropriateness_note: mockResult.feedback.appropriatenessNote,
-          suggested_expression: mockResult.feedback.suggestedExpression ?? '',
-          suggestion_reason: mockResult.feedback.suggestionReason ?? '',
-        },
-        completes_scene: mockResult.completesScene,
-        world_changes: mockResult.worldChanges
-          ? {
-              add_item: mockResult.worldChanges.addItem,
-              set_quest: mockResult.worldChanges.setQuest,
-              set_npc: mockResult.worldChanges.setNpc,
-            }
-          : {},
+    case 'AI_OPENING_SUCCESS': {
+      const result = action.result
+      const narrationEvent: GameEvent = {
+        id: nextId('ev'),
+        kind: 'narration',
+        zh: result.narration.zh,
+        en: result.narration.en,
       }
-      const result = applyTurnResult(state, fallback)
-      // 用玩家输入填充反馈的 userInput
-      const newFeedbacks = [...result.feedbacks!]
-      if (newFeedbacks.length > 0) {
-        newFeedbacks[newFeedbacks.length - 1] = {
-          ...newFeedbacks[newFeedbacks.length - 1],
-          userInput: speech || act,
-        }
+      const dialogueEvent: GameEvent = {
+        id: nextId('ev'),
+        kind: 'npc_dialogue',
+        speakerId: result.npc.speaker_id,
+        speakerName: result.npc.speaker_name,
+        content: result.npc.content,
       }
       return {
         ...state,
-        ...result,
-        feedbacks: newFeedbacks,
+        events: [...state.events, narrationEvent, dialogueEvent],
+        dialogue: { eventId: dialogueEvent.id, status: 'speaking', repeatToken: 0 },
         aiLoading: false,
-        aiError: `AI 调用失败，已使用本地回复: ${action.error}`,
+        aiError: null,
       }
     }
 
-    case 'AI_OPENING_SUCCESS':
-      return { ...state, ...applyOpeningResult(state, action.sceneIndex, action.result) }
-
     case 'AI_OPENING_ERROR':
-      // 开场失败不需要降级，硬编码开场仍然可用
-      return { ...state, aiLoading: false, aiError: `AI 开场生成失败: ${action.error}` }
+      // 开场失败不阻断——感官细节已由前端渲染
+      return {
+        ...state,
+        aiLoading: false,
+        aiError: `AI 开场生成失败: ${action.error}`,
+        awaitingInput: true,
+      }
 
     case 'CLEAR_ERROR':
-      return { ...state, aiError: null }
+      return { ...state, aiError: null, moveError: null, worldError: null }
 
     case 'DIALOGUE_DONE':
       return {
@@ -409,20 +508,6 @@ function reducer(state: GameState, action: GameAction): GameState {
         },
       }
 
-    case 'ADVANCE_SCENE': {
-      if (!state.sceneComplete) return state
-      if (state.sceneIndex >= story.scenes.length - 1) {
-        return { ...state, storyComplete: true, phase: 'ended' }
-      }
-      const nextSceneIdx = state.sceneIndex + 1
-      const entered = enterSceneHardcoded(state, nextSceneIdx)
-      return {
-        ...state,
-        ...entered,
-        aiLoading: true, // 等待 AI 生成新场景开场
-      }
-    }
-
     case 'RESET':
       return { ...initialState }
 
@@ -431,13 +516,14 @@ function reducer(state: GameState, action: GameAction): GameState {
   }
 }
 
-/* ----------------------------- Context + 异步调度 ----------------------------- */
+/* ----------------------------- Context ----------------------------- */
 
 interface GameContextValue {
   state: GameState
   dispatch: Dispatch<GameAction>
-  /** 提交输入（触发 AI 回合） */
   submitInput: (speech: string, action: string) => void
+  moveTo: (target: string) => Promise<void>
+  waitHere: () => Promise<void>
 }
 
 const GameContext = createContext<GameContextValue | null>(null)
@@ -445,34 +531,102 @@ const GameContext = createContext<GameContextValue | null>(null)
 export function GameProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, initialState)
 
-  // 用 ref 追踪哪些场景已请求过 AI 开场，防止 StrictMode 双重触发
-  const openingRequestedRef = useRef<Set<number>>(new Set())
+  // 已请求过 AI 开场的地点集合，防止重复触发
+  const openingRequestedRef = useRef<Set<string>>(new Set())
+  // 已请求过 AI 回合的事件 id
+  const turnRequestedRef = useRef<Set<string>>(new Set())
 
-  // 提交输入：先 dispatch 玩家输入事件，AI 调用在 effect 中处理
-  const submitInput = useCallback(
-    (speech: string, action: string) => {
-      dispatch({ type: 'SUBMIT_INPUT', speech, action })
+  const submitInput = useCallback((speech: string, action: string) => {
+    dispatch({ type: 'SUBMIT_INPUT', speech, action })
+  }, [])
+
+  const moveTo = useCallback(
+    async (target: string) => {
+      if (!state.player) return
+      dispatch({ type: 'MOVE_START', target })
+      try {
+        const result = await fetchMove(state.player, target)
+        dispatch({ type: 'MOVE_SUCCESS', result, target })
+      } catch (e) {
+        dispatch({ type: 'MOVE_ERROR', error: (e as Error).message })
+      }
     },
-    [dispatch],
+    [state.player],
   )
 
-  // ── Effect：AI 回合请求 ──
-  // 当 aiLoading=true 且有 player_input 事件需要 AI 回应时，发起 /api/turn
+  const waitHere = useCallback(async () => {
+    if (!state.player) return
+    dispatch({ type: 'WAIT_START' })
+    try {
+      const result = await fetchWait(state.player)
+      dispatch({ type: 'WAIT_SUCCESS', result })
+    } catch (e) {
+      dispatch({ type: 'MOVE_ERROR', error: (e as Error).message })
+    }
+  }, [state.player])
+
+  // ── Effect：进入故事后加载世界 ──
   useEffect(() => {
-    if (!state.aiLoading || !state.profile || !state.worldState) return
+    if (state.phase !== 'story' || state.world || state.worldLoading) return
+    dispatch({ type: 'WORLD_LOADING' })
+    fetchWorld()
+      .then((w) => dispatch({ type: 'WORLD_LOADED', world: w }))
+      .catch((e) => dispatch({ type: 'WORLD_ERROR', error: (e as Error).message }))
+  }, [state.phase, state.world, state.worldLoading])
 
-    const scene = story.scenes[state.sceneIndex]
-    if (!scene) return
+  // ── Effect：AI 开场 ──
+  useEffect(() => {
+    if (!state.aiLoading || !state.world || !state.player || !state.profile) return
 
-    // 检查是否需要生成回合（最后一个事件是 player_input，且还没有对应的 AI 回应）
-    const lastEvent = state.events[state.events.length - 1]
-    if (lastEvent?.kind !== 'player_input') return
+    const locationId = state.player.location
+    if (openingRequestedRef.current.has(locationId)) return
+    openingRequestedRef.current.add(locationId)
 
-    const speech = lastEvent.speech
-    const action = lastEvent.action
+    const loc = state.world.locations.find((l) => l.id === locationId)
+    if (!loc) return
+
+    const npc = state.world.npcs.find((n) => n.id === loc.resident_npcs[0])
 
     let cancelled = false
-    fetchTurn(scene, state.profile, state.worldState, state.events, { speech, action })
+    fetchOpening(
+      loc,
+      npc,
+      state.profile,
+      state.player,
+      state.world,
+      buildRecentSummary(state.events),
+    )
+      .then((result) => {
+        if (!cancelled) dispatch({ type: 'AI_OPENING_SUCCESS', result, locationId })
+      })
+      .catch((err) => {
+        if (!cancelled) dispatch({ type: 'AI_OPENING_ERROR', error: (err as Error).message })
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [state.aiLoading, state.player, state.world, state.profile, state.events])
+
+  // ── Effect：AI 回合 ──
+  useEffect(() => {
+    if (!state.aiLoading || !state.world || !state.player || !state.profile) return
+
+    const last = state.events[state.events.length - 1]
+    if (!last || last.kind !== 'player_input') return
+    if (turnRequestedRef.current.has(last.id)) return
+    turnRequestedRef.current.add(last.id)
+
+    const player = state.player
+    const loc = state.world.locations.find((l) => l.id === player.location)
+    if (!loc) return
+    const npc = state.world.npcs.find((n) => n.id === loc.resident_npcs[0])
+
+    let cancelled = false
+    fetchTurn(loc, npc, state.profile, player, state.world, state.events, {
+      speech: last.speech,
+      action: last.action,
+    })
       .then((result) => {
         if (!cancelled) dispatch({ type: 'AI_TURN_SUCCESS', result })
       })
@@ -480,48 +634,46 @@ export function GameProvider({ children }: { children: ReactNode }) {
         if (!cancelled) dispatch({ type: 'AI_TURN_ERROR', error: (err as Error).message })
       })
 
-    return () => { cancelled = true }
-  }, [state.aiLoading, state.sceneIndex, state.profile, state.worldState, state.events])
+    return () => {
+      cancelled = true
+    }
+  }, [state.aiLoading, state.events, state.player, state.world, state.profile])
 
-  // ── Effect：AI 开场请求 ──
-  // 当进入新场景且 aiLoading=true 时，发起 /api/opening
-  useEffect(() => {
-    if (!state.aiLoading || !state.profile || state.phase !== 'story') return
-    // 检查是否已请求过此场景的开场
-    if (openingRequestedRef.current.has(state.sceneIndex)) return
-    openingRequestedRef.current.add(state.sceneIndex)
-
-    const scene = story.scenes[state.sceneIndex]
-    if (!scene) return
-
-    const prevSummary = state.sceneIndex > 0
-      ? `玩家完成了「${story.scenes[state.sceneIndex - 1].title}」场景`
-      : undefined
-
-    let cancelled = false
-    fetchOpening(scene, state.profile, prevSummary)
-      .then((result) => {
-        if (!cancelled) dispatch({ type: 'AI_OPENING_SUCCESS', result, sceneIndex: state.sceneIndex })
-      })
-      .catch((err) => {
-        if (!cancelled) dispatch({ type: 'AI_OPENING_ERROR', error: (err as Error).message })
-      })
-
-    return () => { cancelled = true }
-  }, [state.aiLoading, state.sceneIndex, state.profile, state.phase])
-
-  // 重置时清空开场请求记录
+  // 重置时清空记录
   useEffect(() => {
     if (state.phase === 'setup') {
       openingRequestedRef.current.clear()
+      turnRequestedRef.current.clear()
     }
   }, [state.phase])
 
   return (
-    <GameContext.Provider value={{ state, dispatch, submitInput }}>
+    <GameContext.Provider value={{ state, dispatch, submitInput, moveTo, waitHere }}>
       {children}
     </GameContext.Provider>
   )
+}
+
+/** 从事件流生成最近上下文摘要 */
+function buildRecentSummary(events: GameEvent[]): string {
+  const recent = events.slice(-6)
+  return recent
+    .map((e) => {
+      switch (e.kind) {
+        case 'npc_dialogue':
+          return `${e.speakerName}: ${e.content}`
+        case 'player_input':
+          return `玩家: ${e.speech || e.action || ''}`
+        case 'narration':
+          return e.zh || e.en
+        case 'scene_intro':
+          return `[到达 ${e.title}]`
+        default:
+          return ''
+      }
+    })
+    .filter(Boolean)
+    .join('\n')
 }
 
 export function useGame(): GameContextValue {

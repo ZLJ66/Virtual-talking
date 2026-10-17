@@ -72,43 +72,82 @@ app.add_middleware(
 
 # ── 请求/响应模型 ──────────────────────────────────
 
-class SceneInfo(BaseModel):
-    title: str
-    description: str
-    goal: str
-    location: str
-    npcs: list[dict] | None = None
+class LocationInfo(BaseModel):
+    """地点卡（来自世界内容）"""
+
+    id: str
+    name: str
+    name_en: str = ""
+    sensory: dict[str, str] = {}
+    variant: str = ""
+    open_hours: list[int] = [0, 24]
+    resident_npcs: list[str] = []
+
+
+class NPCInfo(BaseModel):
+    """NPC 卡（含运行时印象标签与记忆）"""
+
+    id: str
+    name: str
+    role: str = ""
+    age: int | None = None
+    background: str = ""
+    personality: str = ""
+    speech: dict[str, str] = {}
+    impression_tags: list[str] = []
+    memories: list[str] = []
 
 
 class ProfileInfo(BaseModel):
     englishLevel: str = "beginner"
     name: str | None = None
+    narrationLanguage: str | None = None
 
 
 class WorldStateInfo(BaseModel):
+    """玩家运行时状态（世界层）"""
+
+    location: str = ""
+    time: dict = {}
     inventory: list[str] = []
-    quests: list[dict] = []
-    npcStates: dict | None = None
+    facts: dict[str, bool] = {}
+    knowledge: list[str] = []
+    world_title: str = ""
+    mainline_title: str = ""
+    deadline: dict | None = None
+
+
+class WorldRulesInfo(BaseModel):
+    rules: list[str] = []
+    taboos: list[str] = []
 
 
 class TurnRequest(BaseModel):
     """玩家输入一个回合的请求"""
-    scene: SceneInfo
+
+    location: LocationInfo
+    npc: NPCInfo | None = None
     profile: ProfileInfo
     world_state: WorldStateInfo
+    world_rules: WorldRulesInfo | None = None
     history: list[dict[str, str]] = []
     player_input: dict[str, str]  # {"speech": "...", "action": "..."}
 
 
 class OpeningRequest(BaseModel):
-    """场景开场请求"""
-    scene: SceneInfo
+    """地点开场请求"""
+
+    location: LocationInfo
+    npc: NPCInfo | None = None
     profile: ProfileInfo
-    prev_scene_summary: str | None = None
+    world_state: WorldStateInfo
+    world_rules: WorldRulesInfo | None = None
+    recent_summary: str | None = None
 
 
 class TurnResponse(BaseModel):
     """AI 生成的回合响应"""
+
     narration: dict[str, str]  # {"en": ..., "zh": ...}
     npc: dict[str, str]        # {"speaker_id": ..., "speaker_name": ..., "content": ...}
     feedback: dict | None = None
@@ -128,9 +167,10 @@ async def api_turn(req: TurnRequest):
     """生成一个回合的 AI 响应（旁白 + NPC 对话 + 英语反馈）"""
     try:
         result = await generate_turn(
-            scene=req.scene.model_dump(),
-            profile=req.profile.model_dump(),
+            location=req.location.model_dump(),
+            npc=req.npc.model_dump() if req.npc else None,
             world_state=req.world_state.model_dump(),
+            world_rules=req.world_rules.model_dump() if req.world_rules else None,
             history=req.history,
             player_input=req.player_input,
         )
@@ -142,12 +182,14 @@ async def api_turn(req: TurnRequest):
 
 @app.post("/api/opening", response_model=TurnResponse, responses={500: {"model": ErrorResponse}})
 async def api_opening(req: OpeningRequest):
-    """生成场景开场旁白和 NPC 对话"""
+    """生成地点开场旁白和 NPC 对话"""
     try:
         result = await generate_opening(
-            scene=req.scene.model_dump(),
-            profile=req.profile.model_dump(),
-            prev_scene_summary=req.prev_scene_summary,
+            location=req.location.model_dump(),
+            npc=req.npc.model_dump() if req.npc else None,
+            world_state=req.world_state.model_dump(),
+            world_rules=req.world_rules.model_dump() if req.world_rules else None,
+            recent_summary=req.recent_summary,
         )
         return TurnResponse(**result)
     except Exception as e:
