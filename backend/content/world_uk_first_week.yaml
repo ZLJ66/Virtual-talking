@@ -1,0 +1,262 @@
+# ═══════════════════════════════════════════════════════════
+#  世界定义：在英国的第一周
+# ═══════════════════════════════════════════════════════════
+#  本文件由 backend/world_models.py 的 Pydantic 模型校验。
+#  启动时校验，任何字段错误都会导致启动失败（而非运行时静默降级）。
+#
+#  写作顺序依据《世界层设计.md》10.1：
+#    世界圣经 -> 地点卡 -> NPC 卡 -> 主线节点
+#
+#  ⚠️ 年份必须锁定：政策会变（如 BRP 已被 eVisa 取代），
+#     不锁年份内容会过时，而且过时得很隐蔽。
+# ═══════════════════════════════════════════════════════════
+
+world:
+  id: uk_first_week
+  title: 在英国的第一周
+  year: 2025
+
+  meta:
+    country: 英国
+    city: 曼彻斯特（虚构街区 Ashworth）
+    season: 九月初，开学季
+    weather: 阴，偶有阵雨，傍晚转凉
+    currency: GBP
+    language_env: en-GB
+    timezone: BST
+
+  # ── 世界规则：每次生成都注入 prompt ──────────────────
+  rules:
+    rules:
+      - 这是一个日常向世界，不存在超自然、犯罪、暴力情节
+      - 玩家不会因为英语表达不好而被惩罚、被拒绝服务或被赶走
+      - NPC 会猜测意图、请求澄清、主动帮助，就像现实中遇到外语不流利的人
+      - 政策与流程以 2025 年为准（eVisa / share code 已取代 BRP 实体卡）
+      - 玩家可以完全无视主线自由活动，世界不会因此中断或惩罚
+      - 时间只被「移动」消耗，对话与思考不消耗时间
+    taboos:
+      - 不出现暴力、犯罪、歧视、性相关内容
+      - 不在旁白或台词中评判玩家的英语水平
+      - 不出现「练习」「考试」「评分」等打破沉浸的词汇
+      - 不让 NPC 主动提及玩家应该做什么，除非玩家先问
+
+  # ── 世界事实白名单：主线判定的依据 ──────────────────
+  facts:
+    pre_enrolment_submitted: false
+    rts_check_passed: false
+    student_card_issued: false
+    status_letter_obtained: false
+
+  # ═══════════════════════════════════════════════════
+  #  地点卡（阶段 A 第一批：3 个）
+  # ═══════════════════════════════════════════════════
+  locations:
+    # ── 宿舍：起点，兜底锚点，永远可达 ──────────────────
+    - id: dorm
+      name: 学生宿舍
+      name_en: Halls of Residence
+      open_hours: [0, 24]
+      travel_cost: 0
+      connections: [convenience_store, registry]
+
+      sensory:
+        sight: 走廊的感应灯要拍两下才亮，门牌 214 的漆掉了一角
+        sound: 隔壁隐约放着音乐，楼下车棚的铁门被风撞得哐当响
+        smell: 新刷的乳胶漆味混着纸箱的木浆味，走廊尽头有人在煮泡面
+        touch: 床垫塑料膜还没撕，桌面浮着一层薄灰
+        temperature: 暖气片温着，窗缝漏进一丝凉气
+
+      variants:
+        morning: 阳光斜着照进来，纸箱的影子拉得很长
+        forenoon: 楼道里有人拖着行李箱经过，轮子声一直响到电梯口
+        noon: 楼下传来餐车的铃铛声
+        afternoon: 窗外有人在草坪上扔飞盘，喊声一阵一阵
+        evening: 隔壁的音乐停了，换成走廊尽头的低声交谈
+        night: 只剩台灯亮着，暖气片的滴答声格外清楚
+
+      resident_npcs: [sam]
+
+      state_fields:
+        boxes_unpacked: 3
+        window_closed: false
+
+    # ── 便利店：24 小时，夜里的安全屋 ──────────────────
+    - id: convenience_store
+      name: 街角便利店
+      name_en: Corner Shop
+      open_hours: [0, 24]
+      travel_cost: 1
+      connections: [dorm, registry]
+
+      sensory:
+        sight: 冷白灯管有一根在闪，货架第三层空了一格
+        sound: 冰柜持续低鸣，门口迎宾铃每有人进出就响一声
+        smell: 速溶咖啡和清洁剂混在一起，靠近收银台能闻到刚拆的报纸油墨味
+        touch: 门把手有点黏，暖气片是热的
+        temperature: 比街上暖，玻璃上有一层薄雾
+
+      variants:
+        morning: 店员在补货，过道上堆着没拆的纸箱
+        forenoon: 附近上班的人来买咖啡，收银台前站了三个人
+        noon: 三明治货架被扫空了一半
+        afternoon: 附近中学放学，几个穿校服的少年在挑薯片
+        evening: 三明治只剩两个，关东煮的汤快见底
+        night: 只有一个店员值班，安静得能听见冰柜声
+
+      resident_npcs: [raj]
+
+      state_fields:
+        sandwich_stock: 2
+        umbrella_left: false
+
+    # ── 注册处：主线所在地，有营业时间 ──────────────────
+    - id: registry
+      name: 学校注册处
+      name_en: Student Registration Office
+      open_hours: [9, 17]
+      travel_cost: 1
+      connections: [dorm, convenience_store]
+
+      sensory:
+        sight: 取号机屏幕上的红色数字停在 47，等候区坐了七八个人
+        sound: 广播每隔一会儿念一个号码，键盘敲击声连成一片
+        smell: 打印机的墨粉味，还有塑料座椅被暖气烘出的味道
+        touch: 排队用的隔离带是冰的，宣传册的纸很光滑
+        temperature: 空调开得足，穿薄外套会有点凉
+
+      variants:
+        morning: 刚开门，取号机前已经排到门口
+        forenoon: 队伍散了些，工作人员在挨个确认材料
+        noon: 午休前最后一批，有人在窗口前小声争辩
+        afternoon: 人少了，窗口只剩两个开着
+        evening: 已经关门，玻璃门里只留一盏应急灯
+        night: 彻底黑了，只有安全出口的绿光
+
+      resident_npcs: [elaine]
+
+      state_fields:
+        queue_number: 47
+
+  # ═══════════════════════════════════════════════════
+  #  NPC 卡
+  # ═══════════════════════════════════════════════════
+  npcs:
+    - id: sam
+      name: Sam
+      role: 室友
+      age: 19
+      background: 曼彻斯特本地人，读计算机，比玩家早到一周
+      personality: >-
+        话密，热情得有点过，习惯替别人安排事情。
+        其实自己也紧张，只是用说话掩饰。不太会察觉别人的沉默。
+      speech:
+        style: 语速快，一次说好几句，经常自问自答
+        accent: 曼彻斯特口音，把 bath 说成 bath，末尾音常吞掉
+        catchphrase: "You alright?"
+        tone: 随意热络，不用敬语，把玩家当同屋兄弟
+      variants:
+        - 十九岁本地男生，热情话密，喜欢用「we」代替「you」
+        - 二十出头，安静寡言，说话前会想一下，但愿意帮忙
+
+    - id: raj
+      name: Raj
+      role: 便利店老板
+      age: 54
+      background: 印度裔，来英二十二年，这家店开了十二年
+      personality: >-
+        话不多但观察力强。记得住每个熟客买什么。
+        不喜欢寒暄，但会用行动表示关心——多给一个袋子，或者提醒一句天气。
+      speech:
+        style: 语速慢，句子短，不主动展开话题
+        accent: 轻微印度口音，个别词会拖长
+        catchphrase: mate
+        tone: 随意亲切，对熟客会多问一句
+      variants:
+        - 五十四岁，开了十二年店，管所有客人叫 mate，收银时不太看人
+        - 三十出头，刚接手父亲的店，还在学怎么和客人闲聊，有点用力过猛
+
+    - id: elaine
+      name: Elaine
+      role: 注册处工作人员
+      age: 41
+      background: 在这所学校做了九年学生服务，见过各种材料不齐的情况
+      personality: >-
+        流程熟，说话干脆，不浪费时间。
+        但对明显紧张的人会放慢语速，把要求拆成一小步一小步。
+        她的耐心是职业性的，不是热情。
+      speech:
+        style: 短句，直接进入事项，少寒暄
+        accent: 标准英音，吐字清楚
+        catchphrase: "Right then."
+        tone: 公事公办但不冷，习惯用「we」代表学校
+      variants:
+        - 四十一岁，做了九年，流程烂熟，说话像在念清单
+        - 五十多岁，快退休了，慢条斯理，喜欢在办事间隙聊两句天气
+
+  # ═══════════════════════════════════════════════════
+  #  主线
+  # ═══════════════════════════════════════════════════
+  mainline:
+    title: 安顿下来
+    deadline:
+      day: 5
+      slot: afternoon
+
+    nodes:
+      - id: enrol_online
+        title: 完成线上注册
+        location: dorm
+        requires: []
+        requires_items: []
+        grants_facts: [pre_enrolment_submitted]
+        soft_paths:
+          - 借用室友 Sam 的电脑
+          - 去图书馆用公用电脑
+          - 找注册处说明情况，请他们协助
+
+      - id: rts_check
+        title: 通过 Right to Study 检查
+        location: registry
+        requires: [pre_enrolment_submitted]
+        requires_items: [护照, share code, CAS 信]
+        grants_facts: [rts_check_passed]
+        soft_paths:
+          - 先找室友问材料清单
+          - 联系 Student Centre 预约补办
+          - 请注册处工作人员帮忙核对缺哪一份
+
+      - id: student_card
+        title: 领取学生证
+        location: registry
+        requires: [rts_check_passed]
+        requires_items: []
+        grants_facts: [student_card_issued]
+        soft_paths:
+          - 找同批注册的同学帮忙代问
+          - 次日再来
+
+      - id: status_letter
+        title: 领取在读证明
+        location: registry
+        requires: [student_card_issued]
+        requires_items: []
+        grants_facts: [status_letter_obtained]
+        soft_paths:
+          - 学生系统自助下载
+          - 请注册处工作人员打印
+
+# ═══════════════════════════════════════════════════════
+#  玩家起始状态
+# ═══════════════════════════════════════════════════════
+player_start:
+  location: dorm
+  time:
+    day: 1
+    slot: morning
+  inventory:
+    - 两个行李箱
+    - 护照
+    - CAS 信
+    - 手机
+  knowledge:
+    - 学校要求开学第一周内完成注册
