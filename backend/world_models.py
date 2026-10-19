@@ -469,7 +469,20 @@ class PlayerState(BaseModel):
     knowledge: list[str] = Field(default_factory=list)
     npc_states: dict[str, NPCState] = Field(default_factory=dict)
 
-    # ── 地点进入深度（成本控制）──────────────��─────────
+    # ── 同行者 ────────────────────────────────────────
+    # 跟着玩家一起移动的 NPC。
+    #
+    # 为什么需要这个字段：玩家可以邀请 NPC 同行（"一起去逛逛吧"），
+    # 若系统不记录，NPC 会在玩家移动后凭空消失——这直接破坏世界一致性，
+    # 也是产品最初要解决的痛点之一。
+    #
+    # 约束：同行者必须是世界里存在的 NPC；移动时随玩家一起移动；
+    # 到达新地点后，他们与当地常驻 NPC 同时在场。
+    companions: list[str] = Field(
+        default_factory=list, description="跟随玩家移动的 NPC id 列表"
+    )
+
+    # ── 地点进入深度（成本控制）─────────────────────────
     visit_counts: dict[str, int] = Field(
         default_factory=dict, description="每个地点被进入的次数"
     )
@@ -492,6 +505,34 @@ class PlayerState(BaseModel):
     def visit_depth(self, location_id: str) -> int:
         """当前是第几次进入（用于开场分级）"""
         return self.visit_counts.get(location_id, 0) + 1
+
+    # ── 同行者操作 ────────────────────────────────────
+
+    def add_companion(self, npc_id: str) -> bool:
+        """加入同行者。返回是否发生了变化。"""
+        if npc_id in self.companions:
+            return False
+        self.companions.append(npc_id)
+        return True
+
+    def remove_companion(self, npc_id: str) -> bool:
+        """移出同行者。返回是否发生了变化。"""
+        if npc_id not in self.companions:
+            return False
+        self.companions.remove(npc_id)
+        return True
+
+    def present_npcs(self, resident_npcs: list[str]) -> list[str]:
+        """
+        当前在场的所有 NPC：当地常驻 + 同行者（去重，常驻在前）。
+
+        这是"谁在这个房间里"的唯一来源。AI 只应看到这里返回的人。
+        """
+        seen: list[str] = []
+        for npc_id in list(resident_npcs) + list(self.companions):
+            if npc_id not in seen:
+                seen.append(npc_id)
+        return seen
 
 
 class WorldContent(BaseModel):

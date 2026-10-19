@@ -31,6 +31,10 @@ export interface AITurnResponse {
   world_changes: {
     set_fact?: Record<string, boolean>
     add_item?: string
+    /** AI 提议：某 NPC 开始跟随玩家 */
+    add_companion?: string
+    /** AI 提议：某 NPC 不再跟随 */
+    remove_companion?: string
     set_location?: string
     set_time?: unknown
     [key: string]: unknown
@@ -95,7 +99,11 @@ export function locationToAPI(loc: WorldLocation, slot?: string) {
 }
 
 /** NPC 卡 → 后端需要的结构（含印象标签与记忆） */
-export function npcToAPI(npc: WorldNPC | undefined, player: PlayerState | null) {
+export function npcToAPI(
+  npc: WorldNPC | undefined,
+  player: PlayerState | null,
+  isCompanion = false,
+) {
   if (!npc) return null
   const state = player?.npc_states?.[npc.id]
   return {
@@ -108,7 +116,47 @@ export function npcToAPI(npc: WorldNPC | undefined, player: PlayerState | null) 
     speech: npc.speech,
     impression_tags: state?.impression_tags ?? [],
     memories: state?.memories ?? [],
+    is_companion: isCompanion,
   }
+}
+
+/**
+ * 组装「在场的人」列表：当地常驻 NPC + 跟随玩家的同伴。
+ *
+ * 为什么需要这个函数：以前只传一个 npc，所以同行的人到不了 AI 眼里。
+ * 现在把所有在场者都传过去，由 AI 决定谁说话。
+ */
+export function buildPresentNPCs(
+  location: WorldLocation | null,
+  allNPCs: WorldNPC[],
+  player: PlayerState | null,
+) {
+  if (!location || !player) return []
+
+  const byId = new Map(allNPCs.map((n) => [n.id, n]))
+  const present: NonNullable<ReturnType<typeof npcToAPI>>[] = []
+  const seen = new Set<string>()
+
+  // 1. 当地常驻 NPC
+  for (const id of location.resident_npcs ?? []) {
+    const npc = byId.get(id)
+    if (!npc || seen.has(id)) continue
+    seen.add(id)
+    const payload = npcToAPI(npc, player, false)
+    if (payload) present.push(payload)
+  }
+
+  // 2. 跟随玩家的同伴（即使这个地点不是他的常驻地）
+  for (const id of player.companions ?? []) {
+    if (seen.has(id)) continue
+    const npc = byId.get(id)
+    if (!npc) continue
+    seen.add(id)
+    const payload = npcToAPI(npc, player, true)
+    if (payload) present.push(payload)
+  }
+
+  return present
 }
 
 /** 玩家档案 → 后端结构 */
@@ -131,13 +179,14 @@ export function worldStateToAPI(player: PlayerState, world: WorldResponse) {
     world_title: world.world.title,
     mainline_title: world.mainline.title,
     deadline: world.mainline.deadline,
+    companions: player.companions ?? [],
   }
 }
 
 /** 调用 /api/turn 生成一个回合 */
 export async function fetchTurn(
   location: WorldLocation,
-  npc: WorldNPC | undefined,
+  allNPCs: WorldNPC[],
   profile: CharacterProfile,
   player: PlayerState,
   world: WorldResponse,
@@ -149,7 +198,7 @@ export async function fetchTurn(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       location: locationToAPI(location, player.time.slot),
-      npc: npcToAPI(npc, player),
+      npcs: buildPresentNPCs(location, allNPCs, player),
       profile: profileToAPI(profile),
       world_state: worldStateToAPI(player, world),
       world_rules: world.world.rules,
@@ -167,7 +216,7 @@ export async function fetchTurn(
 /** 调用 /api/opening 生成地点开场 */
 export async function fetchOpening(
   location: WorldLocation,
-  npc: WorldNPC | undefined,
+  allNPCs: WorldNPC[],
   profile: CharacterProfile,
   player: PlayerState,
   world: WorldResponse,
@@ -178,7 +227,7 @@ export async function fetchOpening(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       location: locationToAPI(location, player.time.slot),
-      npc: npcToAPI(npc, player),
+      npcs: buildPresentNPCs(location, allNPCs, player),
       profile: profileToAPI(profile),
       world_state: worldStateToAPI(player, world),
       world_rules: world.world.rules,

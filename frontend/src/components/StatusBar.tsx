@@ -19,7 +19,29 @@ export function StatusBar() {
   const player = state.player
   const world = state.world
   const currentLoc = world?.locations.find((l) => l.id === player?.location)
-  const currentNpc = world?.npcs.find((n) => n.id === currentLoc?.resident_npcs[0])
+
+  // 在场的人 = 当地常驻 + 跟随玩家的同伴（与后端 buildPresentNPCs 逻辑一致）
+  const presentNpcs = (() => {
+    if (!world || !player || !currentLoc) return []
+    const byId = new Map(world.npcs.map((n) => [n.id, n]))
+    const list: { npc: (typeof world.npcs)[number]; isCompanion: boolean }[] = []
+    const seen = new Set<string>()
+    for (const id of currentLoc.resident_npcs ?? []) {
+      const npc = byId.get(id)
+      if (npc && !seen.has(id)) {
+        seen.add(id)
+        list.push({ npc, isCompanion: false })
+      }
+    }
+    for (const id of player.companions ?? []) {
+      const npc = byId.get(id)
+      if (npc && !seen.has(id)) {
+        seen.add(id)
+        list.push({ npc, isCompanion: true })
+      }
+    }
+    return list
+  })()
 
   return (
     <div className="status-bar">
@@ -32,6 +54,14 @@ export function StatusBar() {
         </span>
         {world && (
           <span className="status-goal">主线：{world.mainline.title}</span>
+        )}
+        {player && player.companions.length > 0 && (
+          <span className="status-companion">
+            同行：
+            {player.companions
+              .map((id) => world?.npcs.find((n) => n.id === id)?.name ?? id)
+              .join('、')}
+          </span>
         )}
       </div>
 
@@ -83,11 +113,16 @@ export function StatusBar() {
               {currentLoc?.name_en ? `（${currentLoc.name_en}）` : ''}
             </dd>
 
-            {currentNpc && (
+            {presentNpcs.length > 0 && (
               <>
                 <dt>在场</dt>
                 <dd>
-                  {currentNpc.name}（{currentNpc.role}）
+                  {presentNpcs
+                    .map(
+                      ({ npc, isCompanion }) =>
+                        `${npc.name}（${npc.role}${isCompanion ? '，同行' : ''}）`,
+                    )
+                    .join('；')}
                 </dd>
               </>
             )}
@@ -112,17 +147,19 @@ export function StatusBar() {
                 .join('；') || '（尚未开始）'}
             </dd>
 
-            {currentNpc && player.npc_states[currentNpc.id] && (
-              <>
-                <dt>{currentNpc.name} 记得</dt>
-                <dd>
-                  {[
-                    ...player.npc_states[currentNpc.id].impression_tags,
-                    ...player.npc_states[currentNpc.id].memories,
-                  ].join('；') || '（还不熟悉）'}
-                </dd>
-              </>
-            )}
+            {presentNpcs
+              .filter(({ npc }) => player.npc_states[npc.id])
+              .map(({ npc }) => (
+                <div key={npc.id} style={{ display: 'contents' }}>
+                  <dt>{npc.name} 记得</dt>
+                  <dd>
+                    {[
+                      ...player.npc_states[npc.id].impression_tags,
+                      ...player.npc_states[npc.id].memories,
+                    ].join('；') || '（还不熟悉）'}
+                  </dd>
+                </div>
+              ))}
           </dl>
         </div>
       )}

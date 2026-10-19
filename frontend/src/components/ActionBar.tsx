@@ -132,6 +132,15 @@ export function ActionBar() {
               取消
             </button>
           </div>
+          {player.companions.length > 0 && (
+            <p className="dest-companion-hint">
+              同行：
+              {player.companions
+                .map((id) => world?.npcs.find((n) => n.id === id)?.name ?? id)
+                .join('、')}
+              　（会跟你一起过去）
+            </p>
+          )}
           <ul className="destination-list">
             {destinations.map((loc) => {
               const open = isOpenAt(loc, player.time.slot)

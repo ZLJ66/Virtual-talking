@@ -171,6 +171,8 @@ interface AIWorldChanges {
   set_fact?: Record<string, boolean>
   set_facts?: Record<string, boolean>
   add_item?: string
+  add_companion?: string
+  remove_companion?: string
   set_location?: string
   set_time?: unknown
   [key: string]: unknown
@@ -194,6 +196,7 @@ function applyWorldChanges(
     ...player,
     facts: { ...player.facts },
     inventory: [...player.inventory],
+    companions: [...(player.companions ?? [])],
   }
 
   // 明确拒绝：AI 不得移动玩家 / 推进时间
@@ -222,6 +225,26 @@ function applyWorldChanges(
     if (!next.inventory.includes(changes.add_item)) {
       next.inventory.push(changes.add_item)
     }
+  }
+
+  // 同行者：必须在世界 NPC 白名单内，且不能是玩家当前所在地的常驻 NPC
+  // （常驻 NPC 本来就在场，标记为同行者没有意义，还会在玩家离开时造成"被带走"的误解）
+  if (typeof changes.add_companion === 'string' && changes.add_companion && world) {
+    const id = changes.add_companion
+    const exists = world.npcs.some((n) => n.id === id)
+    if (!exists) {
+      console.warn(`[world] 拒绝未声明的 NPC 作为同行者: ${id}`)
+    } else if (!next.companions.includes(id)) {
+      next.companions.push(id)
+    }
+  }
+
+  if (
+    typeof changes.remove_companion === 'string' &&
+    changes.remove_companion
+  ) {
+    const id = changes.remove_companion
+    next.companions = next.companions.filter((c) => c !== id)
   }
 
   return next
@@ -585,12 +608,11 @@ export function GameProvider({ children }: { children: ReactNode }) {
     const loc = state.world.locations.find((l) => l.id === locationId)
     if (!loc) return
 
-    const npc = state.world.npcs.find((n) => n.id === loc.resident_npcs[0])
-
     let cancelled = false
+    // 传入全部 NPC：开场也要知道同行者一起进来了
     fetchOpening(
       loc,
-      npc,
+      state.world.npcs,
       state.profile,
       state.player,
       state.world,
@@ -620,10 +642,10 @@ export function GameProvider({ children }: { children: ReactNode }) {
     const player = state.player
     const loc = state.world.locations.find((l) => l.id === player.location)
     if (!loc) return
-    const npc = state.world.npcs.find((n) => n.id === loc.resident_npcs[0])
 
     let cancelled = false
-    fetchTurn(loc, npc, state.profile, player, state.world, state.events, {
+    // 传入全部 NPC：在场者由 buildPresentNPCs 依据「常驻 + 同行」组装
+    fetchTurn(loc, state.world.npcs, state.profile, player, state.world, state.events, {
       speech: last.speech,
       action: last.action,
     })

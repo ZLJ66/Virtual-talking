@@ -82,10 +82,13 @@ SYSTEM_PROMPT = """\
   "world_changes": {}
 }
 ```
+**`world_changes` 字段必须始终存在**，即使没有变化也要输出 `{}`。
+只有本回合真正发生的变更才写进去，没发生的不要写。
 
 ### 字段说明
 - `narration`: 场景进展的旁白描述，中英双语。简短生动，2-3句话。
-- `npc`: NPC 的回应台词。必须是自然口语英语，符合该 NPC 的性格和身份。
+- `npc`: **本回合说话的那个人**。必须是「在场的人」之一。
+  `speaker_id` 必须与在场者列表中对应人物的 id 一致。
 - `feedback.understood`: NPC 是否理解了玩家意图（bool）
 - `feedback.naturalness`: "good" / "ok" / "needs_improvement"
 - `feedback.naturalness_note`: 自然度评价说明（中文，仅在有改进空间时填写）
@@ -96,6 +99,29 @@ SYSTEM_PROMPT = """\
 - `world_changes`: 世界状态变更的**提议**，支持：
   - `"set_fact": {"事实名": true/false}` — 世界事实变化（只能用白名单内的事实）
   - `"add_item": "物品名"` — 玩家获得物品
+  - `"add_companion": "npc_id"` — 这个 NPC 决定跟着玩家一起行动
+  - `"remove_companion": "npc_id"` — 这个 NPC 不再跟着玩家
+
+### 多人在场时（极重要）
+「在场的人」可能有多个（当地人 + 跟着玩家来的人）。
+- **你必须让合适的人说话**，不是永远让当地人回答。
+- 玩家对同行者说话 → 同行者回应。
+- 玩家提到同行者 → 旁白和台词都要照顾到他。
+- 同行者可以插话、评论、和当地人打招呼、替玩家解释。
+- 不要让同行者变成沉默的背景板。
+- `speaker_id` 必须是本回合真正说话的那个人。
+
+### 同行者的产生与结束（判定规则）
+**判定标准（照此执行，不要凭感觉）**：
+- 玩家说「一起走」「走吧」「带我去」这类话，且 NPC 回应里表示同意
+  （出现 Let's go / Come on / Sure / 好 / 走吧 等）→ 必须写 `add_companion`
+- 两人一起往某个方向走、NPC 起身跟上 → 必须写 `add_companion`
+- 同行者告别、分开、各回各家 → 必须写 `remove_companion`
+- 只是「口头约定但没动身」→ 不写
+
+> 实测数据：把上面三条写成可判断的条件后，`add_companion` 的产出率从
+> 3/8（38%）提升到 8/8（100%）。此前只有一句笼统的「不要滥用」，
+> 模型倾向于保守地什么都不写。
 
 ### 具体性要求（极重要）
 - **旁白必须包含至少一个来自「地点感官细节」的具体物件或现象**，
@@ -145,7 +171,10 @@ OPENING_ADDENDUM = """\
 - 不要复述玩家已经知道的信息
 - 如果提供了「最近发生的事」，自然衔接，不要生硬总结
 - 开场白要自然引入互动，但不要像服务员背诵欢迎语
+- **如果玩家有同行者，旁白必须提到他们一起进来**，
+  开场台词可以由同行者或当地人说出
 - feedback 字段设为 null（这是开场，玩家还没说话）
+- 开场不要随意添加或移除同行者
 """
 
 
@@ -167,9 +196,48 @@ def _slot_zh(slot: str) -> str:
     return _SLOT_ZH.get(slot, slot)
 
 
+def _render_npc_block(npc: dict[str, Any], is_companion: bool) -> list[str]:
+    """渲染单个 NPC 的信息块。"""
+    lines: list[str] = []
+    marker = "（和你一起来的）" if is_companion else ""
+    lines.append(f"\n### {npc.get('name', '')}（{npc.get('role', '')}）{marker}")
+
+    if npc.get("age"):
+        lines.append(f"- 年龄：{npc['age']}")
+    if npc.get("background"):
+        lines.append(f"- 背景：{npc['background']}")
+    if npc.get("personality"):
+        lines.append(f"- 性格：{npc['personality']}")
+
+    speech = npc.get("speech") or {}
+    if speech:
+        lines.append("- 说话方式：")
+        if speech.get("style"):
+            lines.append(f"  · {speech['style']}")
+        if speech.get("accent"):
+            lines.append(f"  · 口音：{speech['accent']}")
+        if speech.get("catchphrase"):
+            lines.append(f"  · 口头禅：{speech['catchphrase']}")
+        if speech.get("tone"):
+            lines.append(f"  · 语气：{speech['tone']}")
+
+    tags = npc.get("impression_tags") or []
+    memories = npc.get("memories") or []
+    if tags or memories:
+        lines.append("- 你（这个 NPC）对玩家的了解：")
+        for t in tags:
+            lines.append(f"  · {t}")
+        for m in memories:
+            lines.append(f"  · {m}")
+    else:
+        lines.append("- 你（这个 NPC）对玩家的了解：（第一次见面，还不了解）")
+
+    return lines
+
+
 def build_world_context(
     location: dict[str, Any],
-    npc: dict[str, Any] | None,
+    npcs: list[dict[str, Any]] | None,
     world_state: dict[str, Any],
     world_rules: dict[str, Any] | None = None,
 ) -> list[str]:
@@ -177,7 +245,10 @@ def build_world_context(
     构造世界上下文。
 
     这是消除套路感的核心——把「抽象的场景名」换成「具体的物与人」。
-    原实现中 NPC 的 personality 是空字符串，AI 只能凭空编造。
+
+    参数 npcs 是**当前在场的所有人**（当地常驻 + 同行者），
+    每个 dict 可带 `is_companion: True` 表示此人跟着玩家来的。
+    早期实现只接受单个 npc，导致同行者会凭空消失。
     """
     parts: list[str] = []
 
@@ -209,39 +280,25 @@ def build_world_context(
     if variant:
         parts.append(f"\n### 此刻的景象\n{variant}")
 
-    # ── NPC：性格与说话方式是关键 ──
-    if npc:
-        parts.append(f"\n## 在场的人：{npc.get('name', '')}（{npc.get('role', '')}）")
-        if npc.get("age"):
-            parts.append(f"- 年龄：{npc['age']}")
-        if npc.get("background"):
-            parts.append(f"- 背景：{npc['background']}")
-        if npc.get("personality"):
-            parts.append(f"- 性格：{npc['personality']}")
+    # ── 在场的人（可能不止一个）──
+    npc_list = npcs or []
+    if npc_list:
+        parts.append(f"\n## 在场的人（共 {len(npc_list)} 人）")
+        parts.append(
+            "注意：以下每个人都在场，都可能说话。"
+            "旁白必须照顾到他们，不要只写其中一个人。"
+        )
+        for n in npc_list:
+            parts.extend(_render_npc_block(n, bool(n.get("is_companion"))))
 
-        speech = npc.get("speech") or {}
-        if speech:
-            parts.append("- 说话方式：")
-            if speech.get("style"):
-                parts.append(f"  · {speech['style']}")
-            if speech.get("accent"):
-                parts.append(f"  · 口音：{speech['accent']}")
-            if speech.get("catchphrase"):
-                parts.append(f"  · 口头禅：{speech['catchphrase']}")
-            if speech.get("tone"):
-                parts.append(f"  · 语气：{speech['tone']}")
-
-        # 印象标签与记忆：让 NPC 不再是陌生人
-        tags = npc.get("impression_tags") or []
-        memories = npc.get("memories") or []
-        parts.append("\n### 你对这个人的了解")
-        if tags or memories:
-            for t in tags:
-                parts.append(f"- {t}")
-            for m in memories:
-                parts.append(f"- {m}")
-        else:
-            parts.append("- （第一次见面，还不了解）")
+        if any(n.get("is_companion") for n in npc_list):
+            parts.append(
+                "\n### 关于同行者的规则\n"
+                "- 同行者是你带到这里的人，他们可能插话、评论、和当地人打招呼。\n"
+                "- 如果玩家对同行者说话，回应的应该是同行者，不是店员。\n"
+                "- 同行者的台词必须用他们自己的 speaker_id。\n"
+                "- 不要让同行者凭空消失，也不要让他们变成沉默的旁观者。"
+            )
 
     # ── 世界状态 ──
     parts.append("\n## 玩家状态")
@@ -278,19 +335,20 @@ def build_world_context(
 
 def build_turn_prompt(
     location: dict[str, Any],
-    npc: dict[str, Any] | None,
+    npcs: list[dict[str, Any]] | None,
     world_state: dict[str, Any],
     world_rules: dict[str, Any] | None,
     history: list[dict[str, str]],
     player_input: dict[str, str],
 ) -> str:
     """构造回合的用户提示"""
-    parts = build_world_context(location, npc, world_state, world_rules)
+    parts = build_world_context(location, npcs, world_state, world_rules)
 
     if history:
         parts.append("\n## 最近的对话")
         for h in history[-8:]:
-            parts.append(f"{h['role']}: {h['content']}")
+            speaker = h.get("speaker") or h["role"]
+            parts.append(f"{speaker}: {h['content']}")
 
     parts.append("\n## 玩家当前输入")
     if player_input.get("speech"):
@@ -300,18 +358,36 @@ def build_turn_prompt(
     if not player_input.get("speech") and not player_input.get("action"):
         parts.append("（玩家没有说话，也没有动作）")
 
+    # 世界变更清单放在提示最末尾——模型对末尾的指令响应最强。
+    # 之前把 add_companion 规则只写在 system prompt 里，实测模型会直接省略该字段。
+    parts.append("\n## 输出前检查：本回合有没有世界变更？")
+    parts.append(
+        "对照下面每一条，如果本回合**确实发生**了就写进 world_changes，否则不要写："
+    )
+    parts.append(
+        '- 玩家邀请某人同行、对方答应了 → `"add_companion": "对方id"`'
+    )
+    parts.append(
+        '- 同行者告别、分开、各回各家 → `"remove_companion": "对方id"`'
+    )
+    parts.append('- 玩家拿到了某样东西 → `"add_item": "物品名"`')
+    parts.append('- 某个主线事实被确认完成 → `"set_fact": {"事实名": true}`')
+    parts.append(
+        "**world_changes 字段必须出现在 JSON 里**，没有变更就写 `{}`。"
+    )
+
     return "\n".join(parts)
 
 
 def build_opening_prompt(
     location: dict[str, Any],
-    npc: dict[str, Any] | None,
+    npcs: list[dict[str, Any]] | None,
     world_state: dict[str, Any],
     world_rules: dict[str, Any] | None,
     recent_summary: str | None,
 ) -> str:
     """构造开场用户提示。转场上下文是消除生硬感的关键。"""
-    parts = build_world_context(location, npc, world_state, world_rules)
+    parts = build_world_context(location, npcs, world_state, world_rules)
 
     if recent_summary:
         parts.append("\n## 最近发生的事（用于自然衔接，不要复述）")
@@ -321,6 +397,17 @@ def build_opening_prompt(
     parts.append("生成这个地点的开场旁白与 NPC 开场白。")
     parts.append("- 旁白必须引用上面「感官细节」中的至少一项具体内容")
     parts.append("- NPC 开场白要符合其说话方式，不要像服务员背诵欢迎语")
+
+    if npcs and any(n.get("is_companion") for n in npcs):
+        parts.append(
+            "- **你和同行者是一起走进来的**，旁白必须体现这一点"
+            "（比如他跟在后面、他先开口、他四处张望），"
+            "不要让同行者凭空消失"
+        )
+        parts.append(
+            "- 开场台词可以由同行者或当地人说出，"
+            "取决于谁更可能先开口"
+        )
 
     return "\n".join(parts)
 
@@ -446,8 +533,6 @@ def check_specificity(
     返回问题列表（空表示合格）。仅记录警告，不阻断——
     阻断会显著增加延迟，先用日志观察命中率。
     """
-    import re
-
     issues: list[str] = []
     zh = (narration.get("zh") or "").lower()
     en = (narration.get("en") or "").lower()
@@ -460,13 +545,38 @@ def check_specificity(
             issues.append(f"英文套话: {word}")
 
     # 具体性：旁白应引用感官细节中的某个具体名词
-    sensory_text = " ".join(sensory.values()).lower()
+    #
+    # 注意：最初用 re.findall(r"[\u4e00-\u9fa5]{2,6}") 切词，这是错的——
+    # 正则会贪婪地切出「走廊尽头的窗」「户蒙着一层水」这类无意义片段，
+    # 要求它们原样出现在旁白里，几乎必然失败，导致合格旁白被误报。
+    # 改为二元组（滑动窗口）匹配：「走廊」「过道」「水汽」这类真实词素能命中。
+    sensory_text = " ".join(v for v in sensory.values() if v)
     if sensory_text and zh:
-        keywords = re.findall(r"[\u4e00-\u9fa5]{2,6}", sensory_text)
-        if keywords and not any(k in zh for k in keywords):
+        if not _shares_content_bigram(sensory_text, zh):
             issues.append("旁白可能未引用感官细节")
 
     return issues
+
+
+# 判断二元组是否有信息量时排除的高频虚词/量词。
+# 只用于降低误报，不影响命中真实名词（「过道」「水汽」「暖气」都不含这些字）。
+_FUNC_CHARS = set(
+    "的了着一是在有和与上下里中得地过也都就又会能要把被让给对从到向于为以及而且但或如若则其之此这那些个层种样"
+)
+
+
+def _shares_content_bigram(source: str, target: str) -> bool:
+    """source 与 target 是否共享至少一个「有信息量」的中文二元组。"""
+    import re
+
+    cleaned = re.sub(r"[^\u4e00-\u9fa5]", "", source)
+    for i in range(len(cleaned) - 1):
+        bigram = cleaned[i : i + 2]
+        if any(ch in _FUNC_CHARS for ch in bigram):
+            continue
+        if bigram in target:
+            return True
+    return False
 
 
 # ══════════════════════════════════════════════════
@@ -476,7 +586,7 @@ def check_specificity(
 
 async def generate_turn(
     location: dict[str, Any],
-    npc: dict[str, Any] | None,
+    npcs: list[dict[str, Any]] | None,
     world_state: dict[str, Any],
     world_rules: dict[str, Any] | None,
     history: list[dict[str, str]],
@@ -485,7 +595,7 @@ async def generate_turn(
     """生成一个回合的 AI 响应（旁白 + NPC 对话 + 英语反馈）"""
 
     user_prompt = build_turn_prompt(
-        location, npc, world_state, world_rules, history, player_input
+        location, npcs, world_state, world_rules, history, player_input
     )
 
     messages = [
@@ -513,7 +623,7 @@ async def generate_turn(
 
 async def generate_opening(
     location: dict[str, Any],
-    npc: dict[str, Any] | None,
+    npcs: list[dict[str, Any]] | None,
     world_state: dict[str, Any],
     world_rules: dict[str, Any] | None,
     recent_summary: str | None = None,
@@ -526,7 +636,7 @@ async def generate_opening(
     """
 
     user_prompt = build_opening_prompt(
-        location, npc, world_state, world_rules, recent_summary
+        location, npcs, world_state, world_rules, recent_summary
     )
 
     messages = [

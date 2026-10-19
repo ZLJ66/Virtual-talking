@@ -96,6 +96,8 @@ class NPCInfo(BaseModel):
     speech: dict[str, str] = {}
     impression_tags: list[str] = []
     memories: list[str] = []
+    # 是否为跟随玩家同行的 NPC（与当地常驻 NPC 区分）
+    is_companion: bool = False
 
 
 class ProfileInfo(BaseModel):
@@ -115,6 +117,7 @@ class WorldStateInfo(BaseModel):
     world_title: str = ""
     mainline_title: str = ""
     deadline: dict | None = None
+    companions: list[str] = []
 
 
 class WorldRulesInfo(BaseModel):
@@ -126,7 +129,8 @@ class TurnRequest(BaseModel):
     """玩家输入一个回合的请求"""
 
     location: LocationInfo
-    npc: NPCInfo | None = None
+    # 当前在场的所有人：当地常驻 + 同行者。可以只有一个，也可以有多个。
+    npcs: list[NPCInfo] = []
     profile: ProfileInfo
     world_state: WorldStateInfo
     world_rules: WorldRulesInfo | None = None
@@ -138,7 +142,8 @@ class OpeningRequest(BaseModel):
     """地点开场请求"""
 
     location: LocationInfo
-    npc: NPCInfo | None = None
+    # 当前在场的所有人：当地常驻 + 同行者
+    npcs: list[NPCInfo] = []
     profile: ProfileInfo
     world_state: WorldStateInfo
     world_rules: WorldRulesInfo | None = None
@@ -168,7 +173,7 @@ async def api_turn(req: TurnRequest):
     try:
         result = await generate_turn(
             location=req.location.model_dump(),
-            npc=req.npc.model_dump() if req.npc else None,
+            npcs=[n.model_dump() for n in req.npcs],
             world_state=req.world_state.model_dump(),
             world_rules=req.world_rules.model_dump() if req.world_rules else None,
             history=req.history,
@@ -186,7 +191,7 @@ async def api_opening(req: OpeningRequest):
     try:
         result = await generate_opening(
             location=req.location.model_dump(),
-            npc=req.npc.model_dump() if req.npc else None,
+            npcs=[n.model_dump() for n in req.npcs],
             world_state=req.world_state.model_dump(),
             world_rules=req.world_rules.model_dump() if req.world_rules else None,
             recent_summary=req.recent_summary,

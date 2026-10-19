@@ -134,8 +134,23 @@ export interface PlayerState {
   facts: Record<string, boolean>
   knowledge: string[]
   npc_states: Record<string, NPCState>
+  /**
+   * 跟随玩家移动的 NPC id 列表。
+   *
+   * 为什么需要：玩家可以邀请 NPC 同行（"一起去逛逛吧"），
+   * 若系统不记录，NPC 会在移动后凭空消失——这直接破坏世界一致性。
+   */
+  companions: string[]
   visit_counts: Record<string, number>
   last_visit: Record<string, WorldTime>
+}
+
+/**
+ * 当前在场的 NPC（当地常驻 + 同行者）。
+ * `is_companion` 用于让 AI 区分"跟着来的人"和"本地人"。
+ */
+export interface PresentNPC extends WorldNPC {
+  is_companion: boolean
 }
 
 /* ----------------------------- API 响应 ----------------------------- */
