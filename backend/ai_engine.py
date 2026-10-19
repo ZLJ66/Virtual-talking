@@ -27,6 +27,10 @@ AI_BASE_URL = os.getenv("AI_BASE_URL", "https://tokenrhythm.studio/v1")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "qwen3.8-flash")
 
+# 是否启用推理模式。默认关闭——qwen3.8-flash 开推理时单轮约 30 秒，
+# 对话场景不可接受；关闭后约 12 秒且质量无可见下降。
+AI_REASONING = os.getenv("AI_REASONING", "false").lower() in ("1", "true", "yes")
+
 
 # ══════════════════════════════════════════════════
 #  系统提示词（开场与回合共用）
@@ -100,15 +104,23 @@ SYSTEM_PROMPT = """\
 - NPC 的台词要体现其说话方式（语速、口头禅、语气），不要所有人说话都一样。
 
 ### 禁止使用的套话（出现即视为不合格，需重写）
-| 中文 | 英文 |
+| 禁用词 | 说明 |
 |---|---|
-| 你注意到 | You notice that |
-| 似乎 / 仿佛 / 好像 | It seems / as if |
-| 空气中弥漫着 | The air is filled with |
-| 不由得 / 不禁 | cannot help but |
-| 这一刻 | in this moment |
-| 某种 | a certain / some kind of |
-| 让你感到 | makes you feel |
+| 你注意到 | 直接写看到了什么，不要写"你注意到" |
+| 似乎 / 仿佛 / 好像 | 不确定的模糊表述，直接写事实 |
+| **弥漫** | 包含"空气中弥漫着""弥漫着……的味道"，一律不许 |
+| 不由得 / 不禁 | 陈词滥调 |
+| 这一刻 | 陈词滥调 |
+| 某种 | 模糊，写具体是什么 |
+| 让你感到 | 不要替玩家感受 |
+
+英文同理禁用：you notice / it seems / as if / the air is filled with /
+cannot help but / in this moment / some kind of / makes you feel
+
+**正确示范**（用具体物件代替氛围词）：
+- ❌ 空气中弥漫着咖啡的味道 → ✅ 冰柜后面的咖啡机刚响过一声
+- ❌ 他似乎有点紧张 → ✅ 他第三次擦了同一个杯子
+- ❌ 你注意到灯在闪 → ✅ 灯管闪了一下
 
 ### 重要规则
 1. NPC 台词必须用自然口语英语，不要太书面化
@@ -335,12 +347,24 @@ async def call_ai(
         "Content-Type": "application/json",
         "Authorization": f"Bearer {AI_API_KEY}",
     }
-    body = {
+    body: dict[str, Any] = {
         "model": AI_MODEL,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+
+    # 关闭推理模式（qwen3.8-flash 是推理模型）。
+    #
+    # 实测对比（同一 prompt，各 2~5 轮）：
+    #   默认（推理开）：平均 29.6s，reasoning_tokens 622~1230
+    #   reasoning_effort=none：平均 12.1s，reasoning_tokens 恒为 0
+    #
+    # 对话场景每轮等 30 秒不可接受，而关闭推理后输出质量无可见下降
+    # （NPC 语气、口头禅、具体信息均保持）。故默认关闭。
+    # 若需要更强的剧情推理，可通过环境变量 AI_REASONING 打开。
+    if not AI_REASONING:
+        body["reasoning_effort"] = "none"
 
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
@@ -395,14 +419,21 @@ def parse_ai_response(raw: str) -> dict[str, Any]:
 
 
 # ── 套话检测（设计文档 6.2）─────────────────────
+#
+# 注意：最初只写了完整短语（如「空气中弥漫着」），实测发现 AI 会绕开——
+# 它写成「弥漫着新刷乳胶漆的味道」，完整短语匹配不到。
+# 因此改为「核心词」匹配：只要出现该词就判为套话。
+# 核心词宁可宽一些，误报只是日志噪音，漏报则会让套路感溜过去。
 
-BANNED_PHRASES_ZH = [
-    "你注意到", "似乎", "仿佛", "好像", "空气中弥漫着",
-    "不由得", "不禁", "这一刻", "某种", "让你感到",
+BANNED_WORDS_ZH = [
+    "你注意到", "似乎", "仿佛", "不由得", "不禁", "这一刻",
+    "弥漫",      # 覆盖「空气中弥漫着」「弥漫着……的味道」
+    "某种", "让你感到", "好像",
 ]
-BANNED_PHRASES_EN = [
+BANNED_WORDS_EN = [
     "you notice", "it seems", "as if", "the air is filled",
     "cannot help but", "in this moment", "some kind of", "makes you feel",
+    "fills the air", "lingering scent", "scent of",
 ]
 
 
@@ -421,12 +452,12 @@ def check_specificity(
     zh = (narration.get("zh") or "").lower()
     en = (narration.get("en") or "").lower()
 
-    for phrase in BANNED_PHRASES_ZH:
-        if phrase in zh:
-            issues.append(f"中文套话: {phrase}")
-    for phrase in BANNED_PHRASES_EN:
-        if phrase in en:
-            issues.append(f"英文套话: {phrase}")
+    for word in BANNED_WORDS_ZH:
+        if word in zh:
+            issues.append(f"中文套话: {word}")
+    for word in BANNED_WORDS_EN:
+        if word in en:
+            issues.append(f"英文套话: {word}")
 
     # 具体性：旁白应引用感官细节中的某个具体名词
     sensory_text = " ".join(sensory.values()).lower()
