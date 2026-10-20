@@ -10,11 +10,12 @@
 
 from __future__ import annotations
 
+import os
 import json
 import sys
 import urllib.request
 
-BASE = "http://127.0.0.1:8012"
+BASE = os.environ.get("TEST_BASE", "http://127.0.0.1:8012")
 
 _passed = 0
 _failed = 0

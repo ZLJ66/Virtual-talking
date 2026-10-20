@@ -17,11 +17,12 @@
     .venv\\Scripts\\python.exe test_ai_proposal.py
 """
 
+import os
 import sys
 
 import httpx
 
-API = "http://127.0.0.1:8012"
+API = os.environ.get("TEST_BASE", "http://127.0.0.1:8012")
 
 passed = 0
 failed = 0

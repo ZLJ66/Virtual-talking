@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from npc_memory import apply_update_npc, remember_node_completion
 from world_models import MainlineNode, PlayerState, World
 
 
@@ -99,6 +100,8 @@ class JudgeResult:
     rejected: list[str] = field(default_factory=list)
     # 本回合新完成的主线节点 id
     completed: list[str] = field(default_factory=list)
+    # 因节点完成而记住了这件事的 NPC id（代码直写，不经过 AI）
+    remembered: list[str] = field(default_factory=list)
     # 本回合是否刚刚越过截止时间
     just_missed: bool = False
 
@@ -273,6 +276,12 @@ def judge(
     _apply_items(result, changes)
     _apply_companions(world, result, changes)
 
+    # 记忆放在事实之后：本回合刚办成的事要能被算进「在场者」的判断里，
+    # 而且节点完成会自动写入记忆，AI 的补充记忆排在它后面更自然。
+    mem_applied, mem_rejected = apply_update_npc(world, result.player, changes)
+    result.applied.extend(mem_applied)
+    result.rejected.extend(mem_rejected)
+
     # 截止检查放在最后：本回合可能刚好把最后一个节点做完，
     # 先判截止会把「踩线完成」错判成「错过」。
     result.just_missed = _check_deadline(world, result.player)
@@ -319,17 +328,25 @@ def _apply_facts(world: World, result: JudgeResult, changes: dict[str, Any]) -> 
             )
             continue
 
-        _complete_node(result, node)
+        _complete_node(world, result, node)
 
 
-def _complete_node(result: JudgeResult, node: MainlineNode) -> None:
-    """完成一个节点：写入事实、发放物品"""
+def _complete_node(world: World, result: JudgeResult, node: MainlineNode) -> None:
+    """完成一个节点：写入事实、发放物品、让在场的人记住这件事"""
     for fact in node.grants_facts:
         result.player.facts[fact] = True
     for item in node.grants_items:
         if item not in result.player.inventory:
             result.player.inventory.append(item)
     result.completed.append(node.id)
+
+    # 在场者由代码直接记住，不经过 AI。
+    #
+    # 设计文档 4.5 把「涉及世界事实变化（拿到了学生证）」列为值得记的事。
+    # 若交给 AI 提议，AI 这一回合只要漏写，这次大事就永久缺席——
+    # 玩家办成了事，在场的人却毫无印象，等于世界没有看见他做了什么。
+    result.remembered.extend(remember_node_completion(world, result.player, node))
+
     gained = "、".join(node.grants_facts)
     result.applied.append(f"完成「{node.title}」（{gained}）")
 

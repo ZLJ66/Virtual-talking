@@ -461,6 +461,8 @@ class JudgeResponse(BaseModel):
     applied: list[str] = []
     rejected: list[str] = []
     completed: list[str] = []
+    # 因节点完成而记住了这件事的 NPC id。代码直写，不依赖 AI 是否提议。
+    remembered: list[str] = []
     just_missed: bool = False
     mainline_lines: list[str] = []
     progress: dict[str, Any] | None = None
@@ -495,12 +497,15 @@ async def api_judge(req: JudgeRequest):
         logger.info("判定器拒绝: %s", line)
     for line in result.applied:
         logger.info("判定器接受: %s", line)
+    if result.remembered:
+        logger.info("NPC 记住了: %s", ", ".join(result.remembered))
 
     return JudgeResponse(
         player_state=result.player.model_dump(mode="json"),
         applied=result.applied,
         rejected=result.rejected,
         completed=result.completed,
+        remembered=result.remembered,
         just_missed=result.just_missed,
         mainline_lines=mainline_prompt_lines(world, result.player),
         progress=mainline_progress(world, result.player),

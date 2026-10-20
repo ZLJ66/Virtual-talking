@@ -35,6 +35,15 @@ export interface AITurnResponse {
     add_companion?: string
     /** AI 提议：某 NPC 不再跟随 */
     remove_companion?: string
+    /**
+     * AI 提议：某 NPC 记住了一件事。
+     *
+     * 支持单个对象或数组（多人同场时各记一条）。
+     * 后端会过滤掉涉及英语水平、道德评判、以及「此人当时不在场」的记忆。
+     */
+    update_npc?:
+      | { npc_id: string; memory?: string; impression?: string }
+      | { npc_id: string; memory?: string; impression?: string }[]
     set_location?: string
     set_time?: unknown
     [key: string]: unknown

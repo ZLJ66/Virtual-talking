@@ -222,6 +222,13 @@ export interface JudgeResult {
   rejected: string[]
   /** 本回合新完成的主线节点 id */
   completed: string[]
+  /**
+   * 因节点完成而记住了这件事的 NPC id。
+   *
+   * 这些记忆由后端代码直接写入，不依赖 AI 是否提议 update_npc——
+   * 「拿到了学生证」是值得记住的世界事实，交给 AI 决定就会漏。
+   */
+  remembered: string[]
   just_missed: boolean
   mainline_lines: string[]
   progress: MainlineProgress
