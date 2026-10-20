@@ -1,7 +1,12 @@
 // 世界层 API 调用
-// 与后端 /api/world、/api/move、/api/wait 对接
+// 与后端 /api/world、/api/move、/api/wait、/api/judge 对接
 
-import type { MoveResult, PlayerState, WorldResponse } from '../types/world'
+import type {
+  JudgeResult,
+  MoveResult,
+  PlayerState,
+  WorldResponse,
+} from '../types/world'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -44,4 +49,31 @@ export async function fetchWait(playerState: PlayerState): Promise<MoveResult> {
     throw new Error(`等待失败 (${res.status}): ${err}`)
   }
   return res.json() as Promise<MoveResult>
+}
+
+/**
+ * 把 AI 提议的世界变更交给后端判定器裁决。
+ *
+ * **这是事实进入玩家状态的唯一入口。**
+ * 前端不再自己写 set_fact——判定规则（地点对不对、材料带没带、
+ * 前置步骤做没做、窗口过没过）只能有一份实现，放在后端。
+ * 前端复制一份的话，两边必然漂移，而且前端那份很容易被绕过。
+ */
+export async function fetchJudge(
+  playerState: PlayerState,
+  worldChanges: Record<string, unknown>,
+): Promise<JudgeResult> {
+  const res = await fetch(`${API_BASE}/api/judge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      player_state: playerState,
+      world_changes: worldChanges,
+    }),
+  })
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`判定失败 (${res.status}): ${err}`)
+  }
+  return res.json() as Promise<JudgeResult>
 }

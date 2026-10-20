@@ -209,6 +209,11 @@ world:
         requires: []
         requires_items: []
         grants_facts: [pre_enrolment_submitted]
+        # 线上注册完成后，学校要求提供 share code 以核验移民身份。
+        # 2025 年起 BRP 已被 eVisa 取代，出示的就是这个 90 天有效的 share code。
+        # 把它做成「注册后才拿到」的物品，而不是开局就有，
+        # 是为了让「注册 → 核验」之间有一条玩家能看见的因果关系。
+        grants_items: [share code]
         soft_paths:
           - 借用室友 Sam 的电脑
           - 去图书馆用公用电脑
@@ -220,6 +225,15 @@ world:
         requires: [pre_enrolment_submitted]
         requires_items: [护照, share code, CAS 信]
         grants_facts: [rts_check_passed]
+        # 真实世界里 RTS 检查有固定窗口（考文垂 2024 年是 8/27–10/14），
+        # 错过就只能走特殊情况申请。这里的窗口与主线截止时间一致。
+        #
+        # 注意：错过截止后窗口不再拦截（见 mainline.py 的 evaluate_node），
+        # 玩家转入「说明原因、请求通融」的路径——设计文档 8.2 要求因果链
+        # 不能有死胡同，一个永远无法完成的主线节点就是死胡同。
+        window:
+          from: {day: 1, slot: forenoon}
+          to: {day: 5, slot: afternoon}
         soft_paths:
           - 先找室友问材料清单
           - 联系 Student Centre 预约补办
@@ -231,6 +245,7 @@ world:
         requires: [rts_check_passed]
         requires_items: []
         grants_facts: [student_card_issued]
+        grants_items: [学生证]
         soft_paths:
           - 找同批注册的同学帮忙代问
           - 次日再来
@@ -241,6 +256,9 @@ world:
         requires: [student_card_issued]
         requires_items: []
         grants_facts: [status_letter_obtained]
+        # 在读证明是银行开户的前置材料（真实流程），拿到它意味着
+        # 玩家已经具备去银行办账户的条件——虽然银行还不在当前地点图里。
+        grants_items: [在读证明]
         soft_paths:
           - 学生系统自助下载
           - 请注册处工作人员打印

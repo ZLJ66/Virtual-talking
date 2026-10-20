@@ -169,7 +169,11 @@ export function profileToAPI(profile: CharacterProfile) {
 }
 
 /** 世界状态 → 后端结构 */
-export function worldStateToAPI(player: PlayerState, world: WorldResponse) {
+export function worldStateToAPI(
+  player: PlayerState,
+  world: WorldResponse,
+  mainlineLines: string[] = [],
+) {
   return {
     location: player.location,
     time: { day: player.time.day, slot: player.time.slot },
@@ -180,6 +184,10 @@ export function worldStateToAPI(player: PlayerState, world: WorldResponse) {
     mainline_title: world.mainline.title,
     deadline: world.mainline.deadline,
     companions: player.companions ?? [],
+    // 后端 mainline.py 算好的判定结果，已经是人话。
+    // 只传 facts 的话 AI 看到的是 pre_enrolment_submitted 这种 id，
+    // 既不知道是哪件事，也不知道现在能不能办。
+    mainline_lines: mainlineLines,
   }
 }
 
@@ -192,6 +200,7 @@ export async function fetchTurn(
   world: WorldResponse,
   events: Parameters<typeof buildHistory>[0],
   playerInput: { speech: string; action: string },
+  mainlineLines: string[] = [],
 ): Promise<AITurnResponse> {
   const res = await fetch(`${API_BASE}/api/turn`, {
     method: 'POST',
@@ -200,7 +209,7 @@ export async function fetchTurn(
       location: locationToAPI(location, player.time.slot),
       npcs: buildPresentNPCs(location, allNPCs, player),
       profile: profileToAPI(profile),
-      world_state: worldStateToAPI(player, world),
+      world_state: worldStateToAPI(player, world, mainlineLines),
       world_rules: world.world.rules,
       history: buildHistory(events),
       player_input: playerInput,
@@ -221,6 +230,7 @@ export async function fetchOpening(
   player: PlayerState,
   world: WorldResponse,
   recentSummary: string,
+  mainlineLines: string[] = [],
 ): Promise<AIOpeningResponse> {
   const res = await fetch(`${API_BASE}/api/opening`, {
     method: 'POST',
@@ -229,7 +239,7 @@ export async function fetchOpening(
       location: locationToAPI(location, player.time.slot),
       npcs: buildPresentNPCs(location, allNPCs, player),
       profile: profileToAPI(profile),
-      world_state: worldStateToAPI(player, world),
+      world_state: worldStateToAPI(player, world, mainlineLines),
       world_rules: world.world.rules,
       recent_summary: recentSummary,
     }),

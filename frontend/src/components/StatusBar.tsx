@@ -53,7 +53,18 @@ export function StatusBar() {
           )}
         </span>
         {world && (
-          <span className="status-goal">主线：{world.mainline.title}</span>
+          <span className="status-goal">
+            主线：{state.progress?.title ?? world.mainline.title}
+            {state.progress && (
+              <span className="status-progress">
+                {' '}
+                {state.progress.done}/{state.progress.total}
+              </span>
+            )}
+            {state.progress?.missed && (
+              <span className="status-missed">（已逾期）</span>
+            )}
+          </span>
         )}
         {player && player.companions.length > 0 && (
           <span className="status-companion">
@@ -141,11 +152,32 @@ export function StatusBar() {
 
             <dt>主线进度</dt>
             <dd>
-              {Object.entries(player.facts)
-                .filter(([, v]) => v)
-                .map(([k]) => k)
-                .join('；') || '（尚未开始）'}
+              {state.progress ? (
+                <>
+                  {state.progress.done}/{state.progress.total}
+                  {state.progress.done_titles.length > 0 && (
+                    <>　已完成：{state.progress.done_titles.join('、')}</>
+                  )}
+                  {state.progress.pending_titles.length > 0 && (
+                    <>　待办：{state.progress.pending_titles.join('、')}</>
+                  )}
+                </>
+              ) : (
+                '（尚未开始）'
+              )}
             </dd>
+
+            {/* 判定器算出的「现在能办什么、还差什么」。
+                不显示内部 fact id——玩家看到的是「材料还差 share code」，
+                而不是 pre_enrolment_submitted: false。 */}
+            {state.mainlineLines.length > 0 && (
+              <>
+                <dt>现在能做的</dt>
+                <dd style={{ whiteSpace: 'pre-line' }}>
+                  {state.mainlineLines.join('\n')}
+                </dd>
+              </>
+            )}
 
             {presentNpcs
               .filter(({ npc }) => player.npc_states[npc.id])

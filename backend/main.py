@@ -12,6 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from ai_engine import generate_turn, generate_opening
+from mainline import judge as judge_changes
+from mainline import prompt_lines as mainline_prompt_lines
+from mainline import mainline_progress
 from world_loader import (
     WorldLoadError,
     build_initial_player_state,
@@ -20,7 +23,7 @@ from world_loader import (
     move_to,
     MoveError,
 )
-from world_models import PlayerState, WorldContent
+from world_models import PlayerState, World, WorldContent
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
@@ -118,6 +121,9 @@ class WorldStateInfo(BaseModel):
     mainline_title: str = ""
     deadline: dict | None = None
     companions: list[str] = []
+    # 由 mainline.prompt_lines() 生成的人话判定结果。
+    # 不传时 AI 只能看到事实 id，无法判断哪件事现在能做。
+    mainline_lines: list[str] = []
 
 
 class WorldRulesInfo(BaseModel):
@@ -280,12 +286,19 @@ async def api_world():
                     "requires": n.requires,
                     "requires_items": n.requires_items,
                     "grants_facts": n.grants_facts,
+                    "grants_items": n.grants_items,
+                    "window": n.window,
+                    "soft_paths": n.soft_paths,
                 }
                 for n in world.mainline.nodes
             ],
         },
         "facts": world.facts,
         "player_start": initial.model_dump(mode="json"),
+        # 起始时刻的主线判定结果。前端直接拿去渲染，不必自己算一遍，
+        # 免得前后端对「什么算能办」理解不一致。
+        "mainline_lines": mainline_prompt_lines(world, initial),
+        "progress": mainline_progress(world, initial),
     }
 
 
@@ -304,6 +317,31 @@ class MoveResponse(BaseModel):
     player_state: dict[str, Any] | None = None
     time_narration: str = ""
     location: dict[str, Any] | None = None
+    # 这次移动是否刚好越过了主线截止时间
+    mainline_just_missed: bool = False
+    mainline_lines: list[str] = []
+    progress: dict[str, Any] | None = None
+
+
+def _location_payload(world: World, state: PlayerState) -> dict[str, Any]:
+    """
+    地点的运行时快照。
+
+    移动与等待都要返回它，两处各写一遍必然会漂移
+    （改了一处忘了另一处，前端就会拿到缺字段的对象）。
+    """
+    loc = world.get_location(state.location)
+    return {
+        "id": loc.id,
+        "name": loc.name,
+        "name_en": loc.name_en,
+        "travel_cost": loc.travel_cost,
+        "connections": loc.connections,
+        "resident_npcs": loc.resident_npcs,
+        "sensory": loc.sensory.model_dump(),
+        "variant": loc.variant_for(state.time.slot),
+        "is_open": loc.is_open_at(state.time.slot),
+    }
 
 
 @app.post("/api/move", response_model=MoveResponse)
@@ -334,22 +372,18 @@ async def api_move(req: MoveRequest):
     depth = new_state.record_visit(req.target)
     logger.info("移动到 %s（第 %d 次进入）", req.target, depth)
 
-    loc = world.get_location(req.target)
+    # 移动会推进时间，因此必须重新判定截止（判定器内部单向，重复调用安全）。
+    judged = judge_changes(world, new_state, {})
+    new_state = judged.player
+
     return MoveResponse(
         ok=True,
         player_state=new_state.model_dump(mode="json"),
         time_narration=narration,
-        location={
-            "id": loc.id,
-            "name": loc.name,
-            "name_en": loc.name_en,
-            "travel_cost": loc.travel_cost,
-            "connections": loc.connections,
-            "resident_npcs": loc.resident_npcs,
-            "sensory": loc.sensory.model_dump(),
-            "variant": loc.variant_for(new_state.time.slot),
-            "is_open": loc.is_open_at(new_state.time.slot),
-        },
+        location=_location_payload(world, new_state),
+        mainline_just_missed=judged.just_missed,
+        mainline_lines=mainline_prompt_lines(world, new_state),
+        progress=mainline_progress(world, new_state),
     )
 
 
@@ -393,20 +427,114 @@ async def api_wait(req: WaitRequest):
         }
         narration = f"你等了一会儿，{slot_phrase.get(new_state.time.slot.value, '时间过去了')}。"
 
-    loc = world.get_location(new_state.location)
+    # 时间推进后必须重新判定截止。
+    # 判定器内部对 mainline_missed 是单向的，重复调用安全。
+    judged = judge_changes(world, new_state, {})
+    new_state = judged.player
+
     return MoveResponse(
         ok=True,
         player_state=new_state.model_dump(mode="json"),
         time_narration=narration,
-        location={
-            "id": loc.id,
-            "name": loc.name,
-            "name_en": loc.name_en,
-            "travel_cost": loc.travel_cost,
-            "connections": loc.connections,
-            "resident_npcs": loc.resident_npcs,
-            "sensory": loc.sensory.model_dump(),
-            "variant": loc.variant_for(new_state.time.slot),
-            "is_open": loc.is_open_at(new_state.time.slot),
-        },
+        location=_location_payload(world, new_state),
+        mainline_just_missed=judged.just_missed,
+        mainline_lines=mainline_prompt_lines(world, new_state),
+        progress=mainline_progress(world, new_state),
     )
+
+
+# ── 主线判定 ───────────────────────────────────────
+
+
+class JudgeRequest(BaseModel):
+    """应用 AI 提议的世界变更"""
+
+    player_state: dict[str, Any]
+    # AI 返回的 world_changes，形如 {"set_fact": {...}, "add_item": "..."}
+    world_changes: dict[str, Any] = {}
+
+
+class JudgeResponse(BaseModel):
+    """判定结果"""
+
+    player_state: dict[str, Any]
+    applied: list[str] = []
+    rejected: list[str] = []
+    completed: list[str] = []
+    just_missed: bool = False
+    mainline_lines: list[str] = []
+    progress: dict[str, Any] | None = None
+    # 给前端的提示语。空字符串表示没什么要说的。
+    notice: str = ""
+
+
+@app.post("/api/judge", response_model=JudgeResponse)
+async def api_judge(req: JudgeRequest):
+    """
+    校验并应用 AI 提议的世界变更。
+
+    这是事实进入玩家状态的**唯一入口**。
+    前端不再自己写 set_fact —— 旧实现只做白名单检查就写入，
+    AI 一句「她说你已经办好了」就能把世界事实改掉，
+    而玩家可能根本不在场、材料也没带。
+
+    判定器拒绝的变更不会静默消失：rejected 里带着人话原因，
+    既用于排查，也可以给玩家一句「还差什么」的提示。
+    """
+    content = _require_world()
+    world = content.world
+
+    try:
+        state = PlayerState.model_validate(req.player_state)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"玩家状态无效: {e}") from e
+
+    result = judge_changes(world, state, req.world_changes)
+
+    for line in result.rejected:
+        logger.info("判定器拒绝: %s", line)
+    for line in result.applied:
+        logger.info("判定器接受: %s", line)
+
+    return JudgeResponse(
+        player_state=result.player.model_dump(mode="json"),
+        applied=result.applied,
+        rejected=result.rejected,
+        completed=result.completed,
+        just_missed=result.just_missed,
+        mainline_lines=mainline_prompt_lines(world, result.player),
+        progress=mainline_progress(world, result.player),
+        notice=_build_notice(world, result),
+    )
+
+
+def _build_notice(world: World, result) -> str:
+    """
+    把判定结果翻成给玩家看的一句话。
+
+    设计文档 1.3 硬约束：世界层宽容，学习层严格。
+    所以这里只说「世界发生了什么」，不说「你做错了什么」——
+    拒绝也写成客观事实（"还差 X"），不写成评判。
+    """
+    if result.just_missed:
+        deadline = world.mainline.deadline or {}
+        day = deadline.get("day")
+        when = f"第 {day} 天" if day else "截止时间"
+        return (
+            f"{when}的期限已经过去了。注册处现在会要求你说明原因，"
+            "走特殊情况申请——这不是结束，只是换了一条路。"
+        )
+
+    if result.completed:
+        titles = []
+        for node_id in result.completed:
+            for node in world.mainline.nodes:
+                if node.id == node_id:
+                    titles.append(f"「{node.title}」")
+                    break
+        gained = "、".join(titles)
+        if result.player.facts and all(result.player.facts.values()):
+            return f"{gained}办好了。主线全部完成。"
+        return f"{gained}办好了。"
+
+    return ""

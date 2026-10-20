@@ -235,6 +235,16 @@ class MainlineNode(BaseModel):
     requires_items: list[str] = Field(
         default_factory=list, description="需要的物品（背包中必须存在）"
     )
+    grants_items: list[str] = Field(
+        default_factory=list, description="完成该节点后获得的物品（如学生证、在读证明）"
+    )
+    window: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "办理窗口，形如 {from: {day: 1, slot: morning}, to: {day: 4, slot: evening}}。"
+            "两端都可省略。设计文档 5.3：若有 window，则只在窗口内可完成"
+        ),
+    )
     soft_paths: list[str] = Field(
         default_factory=list,
         description="补救路径。设计文档 8.2 要求每个节点至少一条，避免因果链死胡同",
@@ -332,15 +342,59 @@ class World(BaseModel):
                 if fact not in self.facts:
                     errors.append(f"主线节点 {node.id} 的 grants_facts 引用未声明的事实 {fact}")
 
+            # 办理窗口：形状与时段名都要校验。
+            # 写错一个时段名会让 is_within 永远返回 False，
+            # 表现为「这个任务怎么都做不了」，很难从现象反推到内容错误。
+            if node.window is not None:
+                errors.extend(self._validate_window(f"主线节点 {node.id}", node.window))
+
         # 截止时间格式
         if self.mainline.deadline:
-            slot_val = self.mainline.deadline.get("slot")
-            if slot_val is not None and slot_val not in {s.value for s in TimeSlot}:
-                errors.append(f"主线截止时间的 slot 非法: {slot_val!r}")
+            errors.extend(self._validate_window("主线截止时间", self.mainline.deadline))
 
         if errors:
             raise ValueError("世界定义校验失败:\n  - " + "\n  - ".join(errors))
         return self
+
+    def _validate_window(self, label: str, window: dict[str, Any]) -> list[str]:
+        """
+        校验办理窗口 / 截止时间的形状。
+
+        合法形状：{day, slot}、{from: {day, slot}, to: {day, slot}}，
+        其中 from/to 与 day/slot 均可省略。非法形状不会崩，
+        只会让 is_within 静默返回错误结果，所以必须在这里拦住。
+        """
+        errors: list[str] = []
+        if not isinstance(window, dict):
+            return [f"{label} 必须是对象，收到 {type(window).__name__}"]
+
+        points: list[tuple[str, Any]] = []
+        if "from" in window or "to" in window:
+            points.append(("from", window.get("from")))
+            points.append(("to", window.get("to")))
+        else:
+            points.append(("", window))
+
+        valid_slots = {s.value for s in TimeSlot}
+        for where, point in points:
+            prefix = f"{label} 的 {where}" if where else label
+            if point is None:
+                continue
+            if not isinstance(point, dict):
+                errors.append(f"{prefix} 必须是对象，收到 {type(point).__name__}")
+                continue
+            unknown = set(point) - {"day", "slot"}
+            if unknown:
+                errors.append(f"{prefix} 含未知字段 {sorted(unknown)}，只允许 day/slot")
+            day = point.get("day")
+            if day is not None and (not isinstance(day, int) or day < 1):
+                errors.append(f"{prefix} 的 day 必须是 >=1 的整数，收到 {day!r}")
+            slot = point.get("slot")
+            if slot is not None and slot not in valid_slots:
+                errors.append(
+                    f"{prefix} 的 slot 非法: {slot!r}，合法值 {sorted(valid_slots)}"
+                )
+        return errors
 
     def _reachable_from(self, start: str) -> set[str]:
         """从起点出发可达的地点集合（广度优先）"""
@@ -396,6 +450,27 @@ class WorldTime(BaseModel):
                 new_day += 1
         return WorldTime(day=new_day, slot=new_slot)
 
+    def ordinal(self) -> int:
+        """
+        把世界时间压成一个可比较的整数。
+
+        每个时段计 1，跨日加 6。这样「窗口比较」就是简单的整数比较，
+        不需要为 day/slot 分别写分支——分支多了必然写漏一个。
+        """
+        order = [s.value for s in TimeSlot]
+        return (self.day - 1) * len(order) + order.index(self.slot.value)
+
+    @classmethod
+    def from_point(cls, point: dict[str, Any] | None) -> WorldTime | None:
+        """从 {day, slot} 构造；两端都可省略，全缺则返回 None"""
+        if not point:
+            return None
+        day = point.get("day")
+        slot = point.get("slot")
+        if day is None and slot is None:
+            return None
+        return cls(day=int(day) if day is not None else 1, slot=slot or TimeSlot.MORNING)
+
     def is_after(self, deadline: dict[str, Any]) -> bool:
         """判断当前时间是否已越过给定截止时间"""
         d_day = deadline.get("day")
@@ -408,6 +483,23 @@ class WorldTime(BaseModel):
             return False
         order = [s.value for s in TimeSlot]
         return order.index(self.slot.value) > order.index(d_slot)
+
+    def is_within(self, window: dict[str, Any] | None) -> bool:
+        """
+        判断当前时间是否落在办理窗口内（两端闭区间，任一端可省略）。
+
+        窗口缺失时视为「任何时间都可以」，这是绝大多数节点的情形。
+        """
+        if not window:
+            return True
+        start = self.from_point(window.get("from"))
+        end = self.from_point(window.get("to"))
+        now = self.ordinal()
+        if start is not None and now < start.ordinal():
+            return False
+        if end is not None and now > end.ordinal():
+            return False
+        return True
 
     def label_zh(self) -> str:
         return f"第 {self.day} 天 {self.slot.label_zh}"
@@ -468,6 +560,16 @@ class PlayerState(BaseModel):
     facts: dict[str, bool] = Field(default_factory=dict)
     knowledge: list[str] = Field(default_factory=list)
     npc_states: dict[str, NPCState] = Field(default_factory=dict)
+
+    # ── 主线错过标记 ──────────────────────────────────
+    # 时间越过 deadline 后置为 true，之后一直保持。
+    #
+    # 设计文档 5.4：错过不中断游戏、不显示失败，只是世界记住这件事——
+    # 注册处开始要求说明原因，玩家多出一个「解释与请求通融」的场景。
+    # 它是单向的，因为现实中逾期状态不会因为玩家反悔就撤销。
+    mainline_missed: bool = Field(
+        default=False, description="是否已错过主线截止时间（单向，不可撤销）"
+    )
 
     # ── 同行者 ────────────────────────────────────────
     # 跟着玩家一起移动的 NPC。

@@ -193,6 +193,21 @@
   color: var(--text-muted);
 }
 
+/* 主线进度计数：只给数字，不做进度条——进度条会诱导玩家"刷任务"，
+   而这游戏的重点是说英语，不是清任务列表 */
+.status-progress {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+/* 逾期标记：低调的暖色，不是红色警告。
+   设计文档 5.4：错过截止是世界的软后果，不是失败状态。 */
+.status-missed {
+  color: #b45309;
+  margin-left: 4px;
+}
+
 /* 同行者提示：让玩家知道谁跟着自己，否则移动后 NPC 出现会显得突兀 */
 .status-companion {
   font-size: 12px;

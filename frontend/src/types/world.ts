@@ -143,6 +143,30 @@ export interface PlayerState {
   companions: string[]
   visit_counts: Record<string, number>
   last_visit: Record<string, WorldTime>
+  /**
+   * 是否已错过主线截止时间。
+   *
+   * 单向标记：一旦越过截止就保持为 true。设计文档 5.4 规定
+   * 错过不中断游戏、不显示失败，只是世界记住这件事——
+   * 注册处开始要求说明原因，玩家多出一条「解释与请求通融」的路。
+   */
+  mainline_missed?: boolean
+}
+
+/**
+ * 主线进度快照。
+ *
+ * 由后端 mainline.py 计算，前端只负责显示——
+ * 「什么算能办」的规则只能有一份实现，两边各写一遍必然漂移。
+ */
+export interface MainlineProgress {
+  title: string
+  deadline: { day?: number; slot?: string } | null
+  missed: boolean
+  total: number
+  done: number
+  done_titles: string[]
+  pending_titles: string[]
 }
 
 /**
@@ -162,6 +186,9 @@ export interface WorldResponse {
   mainline: Mainline
   facts: Record<string, boolean>
   player_start: PlayerState
+  /** 起始时刻的主线判定结果（人话），后端已算好 */
+  mainline_lines?: string[]
+  progress?: MainlineProgress
 }
 
 export interface MoveResult {
@@ -180,6 +207,26 @@ export interface MoveResult {
     variant: string
     is_open: boolean
   } | null
+  /** 这次移动/等待是否刚好越过了主线截止时间 */
+  mainline_just_missed?: boolean
+  mainline_lines?: string[]
+  progress?: MainlineProgress
+}
+
+/** 判定器对 AI 提议的裁决结果 */
+export interface JudgeResult {
+  player_state: PlayerState
+  /** 被接受的变更，中文描述 */
+  applied: string[]
+  /** 被拒绝的变更，含人话原因 */
+  rejected: string[]
+  /** 本回合新完成的主线节点 id */
+  completed: string[]
+  just_missed: boolean
+  mainline_lines: string[]
+  progress: MainlineProgress
+  /** 给玩家看的一句话，空字符串表示没什么要说的 */
+  notice: string
 }
 
 /* ----------------------------- 展示辅助 ----------------------------- */

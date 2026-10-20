@@ -321,7 +321,19 @@ def build_world_context(
     if world_state.get("knowledge"):
         parts.append(f"- 玩家已知：{'；'.join(world_state['knowledge'])}")
 
-    if world_state.get("mainline_title"):
+    # ── 主线 ──
+    #
+    # mainline_lines 由后端 mainline.py 生成，是已经翻成人话的判定结果，
+    # 形如「- 「通过 Right to Study 检查」（学校注册处）：现在就可以办」。
+    #
+    # 早期实现直接把 pre_enrolment_submitted 这类事实 id 塞进 prompt，
+    # 模型只能看到一个英文单词，既不知道它是哪件事、也不知道能不能做，
+    # 于是它要么忽略主线，要么对着玩家硬推一个当前根本办不了的事。
+    mainline_lines = world_state.get("mainline_lines")
+    if mainline_lines:
+        parts.extend(mainline_lines)
+    elif world_state.get("mainline_title"):
+        # 兜底：调用方没算判定结果时，至少把标题和截止时间给出来。
         parts.append(f"\n## 主线：{world_state['mainline_title']}")
         deadline = world_state.get("deadline")
         if deadline:

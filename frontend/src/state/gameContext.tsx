@@ -23,7 +23,7 @@ import {
 
 import { fetchTurn, fetchOpening } from '../api/ai'
 import type { AITurnResponse, AIOpeningResponse } from '../api/ai'
-import { fetchWorld, fetchMove, fetchWait } from '../api/world'
+import { fetchWorld, fetchMove, fetchWait, fetchJudge } from '../api/world'
 import type {
   CharacterProfile,
   DialogueDisplay,
@@ -34,6 +34,8 @@ import type {
   PracticeMode,
 } from '../types'
 import type {
+  JudgeResult,
+  MainlineProgress,
   MoveResult,
   PlayerState,
   WorldLocation,
@@ -74,6 +76,21 @@ export interface GameState {
 
   // ── 时间流逝叙述 ──
   timeNarration: string
+
+  // ── 主线 ──
+  // 判定结果由后端 mainline.py 计算并随响应返回。
+  // 前端不自己算「什么算能办」——规则只能有一份实现。
+  mainlineLines: string[]
+  progress: MainlineProgress | null
+
+  /**
+   * 待裁决的世界变更。
+   *
+   * AI 返回的 world_changes 不能直接应用，先存在这里，
+   * 由 effect 送去 /api/judge，结果回来后再落状态。
+   * 放在 reducer 外面是因为判定是异步的（一次 HTTP 往返）。
+   */
+  pendingChanges: Record<string, unknown> | null
 }
 
 const initialState: GameState = {
@@ -94,6 +111,9 @@ const initialState: GameState = {
   aiLoading: false,
   aiError: null,
   timeNarration: '',
+  mainlineLines: [],
+  progress: null,
+  pendingChanges: null,
 }
 
 /* ----------------------------- Actions ----------------------------- */
@@ -113,6 +133,8 @@ export type GameAction =
   | { type: 'SUBMIT_INPUT'; speech: string; action: string }
   | { type: 'AI_TURN_SUCCESS'; result: AITurnResponse }
   | { type: 'AI_TURN_ERROR'; error: string }
+  | { type: 'JUDGE_SUCCESS'; result: JudgeResult }
+  | { type: 'JUDGE_FAILED' }
   | { type: 'AI_OPENING_SUCCESS'; result: AIOpeningResponse; locationId: string }
   | { type: 'AI_OPENING_ERROR'; error: string }
   | { type: 'DIALOGUE_DONE' }
@@ -166,90 +188,6 @@ function buildEnterEvents(
   return events
 }
 
-/** AI 返回的世界变更（宽松类型，逐项校验后才应用） */
-interface AIWorldChanges {
-  set_fact?: Record<string, boolean>
-  set_facts?: Record<string, boolean>
-  add_item?: string
-  add_companion?: string
-  remove_companion?: string
-  set_location?: string
-  set_time?: unknown
-  [key: string]: unknown
-}
-
-/**
- * 应用 AI 提议的世界状态变更。
- *
- * **设计约束（世界层设计 5.6）：**
- * AI 返回的 world_changes 只是「提议」，代码校验通过后才生效。
- * 两条最重要的拒绝规则：
- *   1. AI 不得移动玩家
- *   2. AI 不得推进时间
- */
-function applyWorldChanges(
-  player: PlayerState,
-  changes: AIWorldChanges,
-  world: WorldResponse | null,
-): PlayerState {
-  const next: PlayerState = {
-    ...player,
-    facts: { ...player.facts },
-    inventory: [...player.inventory],
-    companions: [...(player.companions ?? [])],
-  }
-
-  // 明确拒绝：AI 不得移动玩家 / 推进时间
-  if ('set_location' in changes || 'set_time' in changes) {
-    console.warn('[world] 拒绝 AI 提议的移动或时间推进', {
-      set_location: changes.set_location,
-      set_time: changes.set_time,
-    })
-  }
-
-  // 事实变更：必须在白名单内
-  const factChanges = changes.set_fact ?? changes.set_facts
-  if (factChanges && world) {
-    const whitelist = new Set(Object.keys(world.facts))
-    for (const [key, value] of Object.entries(factChanges)) {
-      if (!whitelist.has(key)) {
-        console.warn(`[world] 拒绝未声明的事实: ${key}`)
-        continue
-      }
-      next.facts[key] = value
-    }
-  }
-
-  // 物品
-  if (typeof changes.add_item === 'string' && changes.add_item) {
-    if (!next.inventory.includes(changes.add_item)) {
-      next.inventory.push(changes.add_item)
-    }
-  }
-
-  // 同行者：必须在世界 NPC 白名单内，且不能是玩家当前所在地的常驻 NPC
-  // （常驻 NPC 本来就在场，标记为同行者没有意义，还会在玩家离开时造成"被带走"的误解）
-  if (typeof changes.add_companion === 'string' && changes.add_companion && world) {
-    const id = changes.add_companion
-    const exists = world.npcs.some((n) => n.id === id)
-    if (!exists) {
-      console.warn(`[world] 拒绝未声明的 NPC 作为同行者: ${id}`)
-    } else if (!next.companions.includes(id)) {
-      next.companions.push(id)
-    }
-  }
-
-  if (
-    typeof changes.remove_companion === 'string' &&
-    changes.remove_companion
-  ) {
-    const id = changes.remove_companion
-    next.companions = next.companions.filter((c) => c !== id)
-  }
-
-  return next
-}
-
 /* ----------------------------- Reducer ----------------------------- */
 
 function reducer(state: GameState, action: GameAction): GameState {
@@ -290,6 +228,9 @@ function reducer(state: GameState, action: GameAction): GameState {
         world: action.world,
         player: { ...start, visit_counts: { [start.location]: 1 } },
         events,
+        // 起始时刻的主线判定结果，后端已算好
+        mainlineLines: action.world.mainline_lines ?? [],
+        progress: action.world.progress ?? null,
         aiLoading: true, // 等待 AI 生成开场
       }
     }
@@ -327,6 +268,17 @@ function reducer(state: GameState, action: GameAction): GameState {
 
       const newEvents = buildEnterEvents(enterLoc, r.time_narration, isFirstVisit)
 
+      // 越过截止时间时，让世界自己说出来。
+      // 不做成弹窗或红字警告——设计文档 5.4 明确要求压力由世界施加。
+      if (r.mainline_just_missed) {
+        newEvents.push({
+          id: nextId('ev'),
+          kind: 'narration',
+          zh: '（注册处的公告栏上贴出了一张新的通知，日期是今天。）',
+          en: '',
+        })
+      }
+
       return {
         ...state,
         moving: false,
@@ -334,6 +286,8 @@ function reducer(state: GameState, action: GameAction): GameState {
         player: r.player_state,
         events: [...state.events, ...newEvents],
         timeNarration: r.time_narration,
+        mainlineLines: r.mainline_lines ?? state.mainlineLines,
+        progress: r.progress ?? state.progress,
         dialogue: { eventId: null, status: 'idle', repeatToken: 0 },
         awaitingInput: false,
         // 第 4 次及以后进入不再调用 AI（成本控制，设计文档 5.5）
@@ -365,6 +319,8 @@ function reducer(state: GameState, action: GameAction): GameState {
         player: r.player_state,
         events: [...state.events, narrationEvent],
         timeNarration: r.time_narration,
+        mainlineLines: r.mainline_lines ?? state.mainlineLines,
+        progress: r.progress ?? state.progress,
         awaitingInput: true,
       }
     }
@@ -433,23 +389,50 @@ function reducer(state: GameState, action: GameAction): GameState {
         feedback.userInput = lastPlayer.speech || lastPlayer.action || ''
       }
 
-      // 世界状态变更由代码校验后应用
-      let player = state.player
-      if (player && result.world_changes) {
-        player = applyWorldChanges(player, result.world_changes, state.world)
-      }
-
+      // 世界状态变更不在这里应用。
+      //
+      // AI 的 world_changes 只是提议，真正的判定（地点对不对、材料带没带、
+      // 前置步骤做没做）在后端 mainline.py 里。effect 收到 AI 响应后
+      // 会把提议交给 /api/judge，结果经 JUDGE_SUCCESS 落回状态。
+      // 早期实现在这里直接写 facts，等于让 AI 自己给自己发证。
       return {
         ...state,
         events: [...state.events, narrationEvent, dialogueEvent],
         feedbacks: [...state.feedbacks, feedback],
-        player,
         dialogue: { eventId: dialogueEvent.id, status: 'speaking', repeatToken: 0 },
         awaitingInput: false,
         aiLoading: false,
         aiError: null,
+        // 标记有提议待裁决，effect 据此调用判定器
+        pendingChanges: result.world_changes ?? null,
       }
     }
+
+    case 'JUDGE_SUCCESS': {
+      const r = action.result
+      const newEvents: GameEvent[] = [...state.events]
+
+      // 判定器给出的提示写成旁白，让「办好了」这件事发生在世界里，
+      // 而不是弹一个 UI 通知。设计文档 5.4：世界施加压力，UI 不施加。
+      if (r.notice) {
+        newEvents.push({ id: nextId('ev'), kind: 'narration', zh: r.notice, en: '' })
+      }
+
+      return {
+        ...state,
+        player: r.player_state,
+        events: newEvents,
+        mainlineLines: r.mainline_lines ?? state.mainlineLines,
+        progress: r.progress ?? state.progress,
+        pendingChanges: null,
+      }
+    }
+
+    case 'JUDGE_FAILED':
+      // 清掉待裁决标记。若不清理，effect 会因为 pendingChanges
+      // 仍是同一个对象而反复重试，变成对后端的无限轮询。
+      // 世界这一回合不变化——宁可不动，也不应用未经校验的变更。
+      return { ...state, pendingChanges: null }
 
     case 'AI_TURN_ERROR':
       // 世界层下不降级到 mock（mock 数据已废弃），直接报错让用户重试
@@ -597,6 +580,47 @@ export function GameProvider({ children }: { children: ReactNode }) {
       .catch((e) => dispatch({ type: 'WORLD_ERROR', error: (e as Error).message }))
   }, [state.phase, state.world, state.worldLoading])
 
+  // ── Effect：把 AI 提议的变更交给判定器 ──
+  //
+  // AI 说「她已经给你办好了」只是提议。真正决定事实是否成立的是后端：
+  // 人在不在那个地点、材料带没带、前置步骤做没做、窗口过没过。
+  // 判定是异步的（一次 HTTP 往返），所以不能在 reducer 里做。
+  useEffect(() => {
+    if (!state.pendingChanges || !state.player) return
+
+    const changes = state.pendingChanges
+
+    // 空对象 = AI 本回合没有提议任何变更，这是大多数回合的常态。
+    // 直接跳过，省一次往返；否则每轮都要为「什么都没发生」多请求一次。
+    if (Object.keys(changes).length === 0) {
+      dispatch({ type: 'JUDGE_FAILED' })
+      return
+    }
+
+    let cancelled = false
+
+    fetchJudge(state.player, changes)
+      .then((result) => {
+        if (cancelled) return
+        // 拒绝的变更记到控制台。玩家看不到这些——他看到的只有
+        // 办事员说的那句话；世界没有改变这件事本身就是反馈。
+        if (result.rejected.length > 0) {
+          console.info('[judge] 拒绝的变更', result.rejected)
+        }
+        dispatch({ type: 'JUDGE_SUCCESS', result })
+      })
+      .catch((err) => {
+        // 判定失败不能让玩家卡住：保留原状态，清掉待裁决标记。
+        // 宁可这一回合世界没变化，也不要应用未经校验的变更。
+        console.warn('[judge] 判定失败', err)
+        if (!cancelled) dispatch({ type: 'JUDGE_FAILED' })
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [state.pendingChanges, state.player])
+
   // ── Effect：AI 开场 ──
   useEffect(() => {
     if (!state.aiLoading || !state.world || !state.player || !state.profile) return
@@ -617,6 +641,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       state.player,
       state.world,
       buildRecentSummary(state.events),
+      state.mainlineLines,
     )
       .then((result) => {
         if (!cancelled) dispatch({ type: 'AI_OPENING_SUCCESS', result, locationId })
@@ -645,10 +670,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
 
     let cancelled = false
     // 传入全部 NPC：在场者由 buildPresentNPCs 依据「常驻 + 同行」组装
-    fetchTurn(loc, state.world.npcs, state.profile, player, state.world, state.events, {
-      speech: last.speech,
-      action: last.action,
-    })
+    fetchTurn(
+      loc,
+      state.world.npcs,
+      state.profile,
+      player,
+      state.world,
+      state.events,
+      { speech: last.speech, action: last.action },
+      state.mainlineLines,
+    )
       .then((result) => {
         if (!cancelled) dispatch({ type: 'AI_TURN_SUCCESS', result })
       })
