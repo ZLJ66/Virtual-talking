@@ -15,9 +15,20 @@ import type {
 
 const API_BASE = 'http://localhost:8000'
 
+/** 单句台词。一次回合可能有 1~3 句（多人同场时）。 */
+export interface AIDialogueLine {
+  speaker_id: string
+  speaker_name: string
+  content: string
+  /** 这句是对谁说的：'player' 或另一个 NPC 的 id */
+  reply_to?: string
+}
+
 export interface AITurnResponse {
   narration: { en: string; zh: string }
-  npc: { speaker_id: string; speaker_name: string; content: string }
+  /** 本回合所有台词，按说话顺序。旧后端可能没有这个字段，用 npc 兜底。 */
+  lines?: AIDialogueLine[]
+  npc: AIDialogueLine
   feedback: {
     understood: boolean
     naturalness: 'good' | 'ok' | 'needs_improvement'
@@ -52,7 +63,8 @@ export interface AITurnResponse {
 
 export interface AIOpeningResponse {
   narration: { en: string; zh: string }
-  npc: { speaker_id: string; speaker_name: string; content: string }
+  lines?: AIDialogueLine[]
+  npc: AIDialogueLine
   feedback: null
   completes_scene: boolean
   world_changes: Record<string, unknown>
@@ -79,7 +91,15 @@ export function buildHistory(
         history.push({ role: 'narration', content: ev.en || ev.zh || '' })
         break
       case 'npc_dialogue':
-        history.push({ role: 'npc', content: ev.content || '' })
+        // 说话人名字必须带上。早期版本只传 content，模型看到的最近
+        // 8 条历史里所有 NPC 台词都是「npc: ...」，分不清谁说了什么——
+        // 这是「两个 NPC 在场却以为都在跟我一个人说话」的直接原因之一。
+        history.push({
+          role: 'npc',
+          content: ev.speakerName
+            ? `${ev.speakerName}: ${ev.content || ''}`
+            : ev.content || '',
+        })
         break
       case 'player_input': {
         const text = [ev.speech, ev.action].filter(Boolean).join(' / ')

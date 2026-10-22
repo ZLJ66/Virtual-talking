@@ -104,7 +104,7 @@ const initialState: GameState = {
   player: null,
   events: [],
   feedbacks: [],
-  dialogue: { eventId: null, status: 'idle', repeatToken: 0 },
+  dialogue: { eventId: null, status: 'idle', repeatToken: 0, queue: [] },
   awaitingInput: false,
   moving: false,
   moveError: null,
@@ -186,6 +186,51 @@ function buildEnterEvents(
   }
 
   return events
+}
+
+/**
+ * 把 AI 返回的多句台词展开成事件。
+ *
+ * 返回 `{ first, rest }`：first 立刻进事件流并用打字机播放，
+ * rest 进 dialogue.queue 排队，等前一句打完再逐句追加。
+ *
+ * 为什么要排队而不是全部追加：三句话同时出现等于给玩家看一段剧本，
+ * 玩家还没读到第二句，第一句就已经"说完了"。逐句播才像对话。
+ *
+ * 兼容旧后端：没有 `lines` 字段时退回 `npc` 单句。
+ */
+function buildDialogueEvents(result: {
+  lines?: { speaker_id: string; speaker_name: string; content: string }[]
+  npc: { speaker_id: string; speaker_name: string; content: string }
+}): {
+  first: Extract<GameEvent, { kind: 'npc_dialogue' }>
+  rest: Extract<GameEvent, { kind: 'npc_dialogue' }>[]
+} {
+  const raw =
+    result.lines && result.lines.length > 0 ? result.lines : [result.npc]
+
+  const events = raw
+    .filter((l) => (l.content ?? '').trim() !== '')
+    .map<Extract<GameEvent, { kind: 'npc_dialogue' }>>((l) => ({
+      id: nextId('ev'),
+      kind: 'npc_dialogue',
+      speakerId: l.speaker_id,
+      speakerName: l.speaker_name,
+      content: l.content,
+    }))
+
+  // AI 一句都没给（极少见）：补一句占位，避免对话气泡完全消失
+  if (events.length === 0) {
+    events.push({
+      id: nextId('ev'),
+      kind: 'npc_dialogue',
+      speakerId: result.npc?.speaker_id ?? 'unknown',
+      speakerName: result.npc?.speaker_name ?? '???',
+      content: result.npc?.content ?? '...',
+    })
+  }
+
+  return { first: events[0], rest: events.slice(1) }
 }
 
 /* ----------------------------- Reducer ----------------------------- */
@@ -288,7 +333,7 @@ function reducer(state: GameState, action: GameAction): GameState {
         timeNarration: r.time_narration,
         mainlineLines: r.mainline_lines ?? state.mainlineLines,
         progress: r.progress ?? state.progress,
-        dialogue: { eventId: null, status: 'idle', repeatToken: 0 },
+        dialogue: { eventId: null, status: 'idle', repeatToken: 0, queue: [] },
         awaitingInput: false,
         // 第 4 次及以后进入不再调用 AI（成本控制，设计文档 5.5）
         aiLoading: visits < 4,
@@ -351,13 +396,9 @@ function reducer(state: GameState, action: GameAction): GameState {
         zh: result.narration.zh,
         en: result.narration.en,
       }
-      const dialogueEvent: GameEvent = {
-        id: nextId('ev'),
-        kind: 'npc_dialogue',
-        speakerId: result.npc.speaker_id,
-        speakerName: result.npc.speaker_name,
-        content: result.npc.content,
-      }
+      // 多句台词：第一句立刻播，其余排队等前一句打完
+      const { first: dialogueEvent, rest: queuedDialogue } =
+        buildDialogueEvents(result)
 
       const feedback: ExpressionFeedback = result.feedback
         ? {
@@ -399,7 +440,12 @@ function reducer(state: GameState, action: GameAction): GameState {
         ...state,
         events: [...state.events, narrationEvent, dialogueEvent],
         feedbacks: [...state.feedbacks, feedback],
-        dialogue: { eventId: dialogueEvent.id, status: 'speaking', repeatToken: 0 },
+        dialogue: {
+          eventId: dialogueEvent.id,
+          status: 'speaking',
+          repeatToken: 0,
+          queue: queuedDialogue,
+        },
         awaitingInput: false,
         aiLoading: false,
         aiError: null,
@@ -451,17 +497,17 @@ function reducer(state: GameState, action: GameAction): GameState {
         zh: result.narration.zh,
         en: result.narration.en,
       }
-      const dialogueEvent: GameEvent = {
-        id: nextId('ev'),
-        kind: 'npc_dialogue',
-        speakerId: result.npc.speaker_id,
-        speakerName: result.npc.speaker_name,
-        content: result.npc.content,
-      }
+      const { first: dialogueEvent, rest: queuedDialogue } =
+        buildDialogueEvents(result)
       return {
         ...state,
         events: [...state.events, narrationEvent, dialogueEvent],
-        dialogue: { eventId: dialogueEvent.id, status: 'speaking', repeatToken: 0 },
+        dialogue: {
+          eventId: dialogueEvent.id,
+          status: 'speaking',
+          repeatToken: 0,
+          queue: queuedDialogue,
+        },
         aiLoading: false,
         aiError: null,
       }
@@ -479,19 +525,39 @@ function reducer(state: GameState, action: GameAction): GameState {
     case 'CLEAR_ERROR':
       return { ...state, aiError: null, moveError: null, worldError: null }
 
-    case 'DIALOGUE_DONE':
+    case 'DIALOGUE_DONE': {
+      // 队列里还有台词：播下一句，仍然不放开输入
+      if (state.dialogue.queue.length > 0) {
+        const [next, ...remaining] = state.dialogue.queue
+        return {
+          ...state,
+          events: [...state.events, next],
+          dialogue: {
+            eventId: next.id,
+            status: 'speaking',
+            repeatToken: 0,
+            queue: remaining,
+          },
+          awaitingInput: false,
+        }
+      }
+      // 全部说完，才让玩家输入
       return {
         ...state,
         dialogue: { ...state.dialogue, status: 'done' },
         awaitingInput: !state.aiLoading,
       }
+    }
 
     case 'INTERRUPT': {
       if (state.dialogue.status !== 'speaking' && state.dialogue.status !== 'paused')
         return state
+      // 打断 = 玩家插话了，剩下的句子不再说出口。
+      // 队列直接丢弃：AI 已按完整台词算过 world_changes，
+      // 但玩家不该看到自己打断掉的话。
       return {
         ...state,
-        dialogue: { ...state.dialogue, status: 'interrupted' },
+        dialogue: { ...state.dialogue, status: 'interrupted', queue: [] },
         awaitingInput: true,
       }
     }
@@ -529,7 +595,7 @@ interface GameContextValue {
   dispatch: Dispatch<GameAction>
   submitInput: (speech: string, action: string) => void
   moveTo: (target: string) => Promise<void>
-  waitHere: () => Promise<void>
+  waitHere: (slots?: number) => Promise<void>
 }
 
 const GameContext = createContext<GameContextValue | null>(null)
@@ -560,16 +626,19 @@ export function GameProvider({ children }: { children: ReactNode }) {
     [state.player],
   )
 
-  const waitHere = useCallback(async () => {
-    if (!state.player) return
-    dispatch({ type: 'WAIT_START' })
-    try {
-      const result = await fetchWait(state.player)
-      dispatch({ type: 'WAIT_SUCCESS', result })
-    } catch (e) {
-      dispatch({ type: 'MOVE_ERROR', error: (e as Error).message })
-    }
-  }, [state.player])
+  const waitHere = useCallback(
+    async (slots = 1) => {
+      if (!state.player) return
+      dispatch({ type: 'WAIT_START' })
+      try {
+        const result = await fetchWait(state.player, slots)
+        dispatch({ type: 'WAIT_SUCCESS', result })
+      } catch (e) {
+        dispatch({ type: 'MOVE_ERROR', error: (e as Error).message })
+      }
+    },
+    [state.player],
+  )
 
   // ── Effect：进入故事后加载世界 ──
   useEffect(() => {

@@ -65,11 +65,14 @@ SYSTEM_PROMPT = """\
     "en": "英文旁白，描述发生了什么",
     "zh": "中文旁白，同内容的中文翻译"
   },
-  "npc": {
-    "speaker_id": "NPC的ID",
-    "speaker_name": "NPC显示名称",
-    "content": "NPC说的英文台词"
-  },
+  "lines": [
+    {
+      "speaker_id": "NPC的ID",
+      "speaker_name": "NPC显示名称",
+      "content": "NPC说的英文台词",
+      "reply_to": "player"
+    }
+  ],
   "feedback": {
     "understood": true,
     "naturalness": "good",
@@ -87,8 +90,16 @@ SYSTEM_PROMPT = """\
 
 ### 字段说明
 - `narration`: 场景进展的旁白描述，中英双语。简短生动，2-3句话。
-- `npc`: **本回合说话的那个人**。必须是「在场的人」之一。
-  `speaker_id` 必须与在场者列表中对应人物的 id 一致。
+- `lines`: **本回合说话的列表**，1~3 项，按说话顺序排列。
+  每一项是一句台词。大多数时候只有 1 项（一个人回一句话）。
+  多人同场、玩家同时问了几个人、或者有人插话时才会有多项。
+  - `speaker_id` 必须与「在场的人」列表中对应人物的 id 一致
+  - `reply_to`: 这句是对谁说的。对玩家说写 `"player"`，
+    对另一个 NPC 说写那个 NPC 的 id
+  - **第 1 项必须是回应玩家的话**（`reply_to` 为 `"player"`），
+    除非玩家这回合没说话也没有动作
+  - **最多 3 项**。超过 3 项就变成一段剧本，玩家要读好几屏才能回一句话
+  - 不要为了凑数硬塞台词。一个人说一句就够了，就只写 1 项
 - `feedback.understood`: NPC 是否理解了玩家意图（bool）
 - `feedback.naturalness`: "good" / "ok" / "needs_improvement"
 - `feedback.naturalness_note`: 自然度评价说明（中文，仅在有改进空间时填写）
@@ -110,7 +121,38 @@ SYSTEM_PROMPT = """\
 - 玩家提到同行者 → 旁白和台词都要照顾到他。
 - 同行者可以插话、评论、和当地人打招呼、替玩家解释。
 - 不要让同行者变成沉默的背景板。
-- `speaker_id` 必须是本回合真正说话的那个人。
+- 每一项的 `speaker_id` 必须是这句台词真正说话的那个人。
+
+### 玩家同时对多个人说话（极重要）
+玩家的一段话里可能对不同的人说了不同的事，动作里可能写了
+「然后转向 X」「接着对 Y 说」「之后看着 Z」。
+
+**这是必须分开回应的场景。** 不要把两件事合并成一个人的回答。
+
+示例：
+- 玩家话语：「这个多少钱？还有，你觉得这个牌子怎么样？」
+  动作：「先问 Raj，然后转向 Sam」
+  → `lines[0]` = Raj 回答价格（`reply_to: "player"`）
+  → `lines[1]` = Sam 回答对牌子的看法（`reply_to: "player"`）
+
+- 玩家话语：「你们俩认识？」
+  → `lines[0]` = 当地人回答（`reply_to: "player"`）
+  → `lines[1]` = 同行者补一句（`reply_to: "player"` 或当地人的 id）
+
+规则：
+- 玩家明确对几个人说话，就分别给每个人一句
+- 按玩家提到的顺序排
+- 每句都要回应玩家真正说的那部分，不要串台
+- 如果玩家其实只问了一个人（哪怕提到了另一个人的名字），
+  就只让一个人回答
+
+### NPC 之间的互动
+- 在场的人不止一个时，可以让第 2、3 项是 NPC 对 NPC 说话
+  （当地人回同行者一句、同行者插嘴、两人互相打招呼、一个人纠正另一个人）
+- 但**第 1 项永远是对玩家说的**
+- 不要每回合都这样。只有自然的时候才发生——
+  玩家问了句两边都有关的话、或者一个人刚说了句别人忍不住要接的话
+- NPC 互相说话时不要连着说三轮以上，把话头交回给玩家
 
 ### 同行者的产生与结束（判定规则）
 **判定标准（照此执行，不要凭感觉）**：
@@ -202,7 +244,7 @@ OPENING_ADDENDUM = """\
 ### 本次任务：生成场景开场
 这是玩家刚到达一个新地点。请生成：
 - 一段旁白：让玩家"看见"这个地方（引用感官细节），2-3 句
-- 一句 NPC 的开场白：符合该 NPC 的性格与说话方式
+- `lines` 里 1~2 句开场白：符合说话者性格与说话方式
 
 注意：
 - 不要复述玩家已经知道的信息
@@ -210,6 +252,8 @@ OPENING_ADDENDUM = """\
 - 开场白要自然引入互动，但不要像服务员背诵欢迎语
 - **如果玩家有同行者，旁白必须提到他们一起进来**，
   开场台词可以由同行者或当地人说出
+- 在场有两个人时，可以让同行者和当地人各说一句（比如互相打招呼），
+  但**不要超过 2 句**——开场是让玩家接话的，不是演一段戏
 - feedback 字段设为 null（这是开场，玩家还没说话）
 - 开场不要随意添加或移除同行者
 """
@@ -237,7 +281,12 @@ def _render_npc_block(npc: dict[str, Any], is_companion: bool) -> list[str]:
     """渲染单个 NPC 的信息块。"""
     lines: list[str] = []
     marker = "（和你一起来的）" if is_companion else ""
-    lines.append(f"\n### {npc.get('name', '')}（{npc.get('role', '')}）{marker}")
+    # id 必须出现在这里：prompt 要求 speaker_id 用这个 id，
+    # 但早期版本只渲染了名字，模型只能靠猜，多说话人时会编造 id。
+    lines.append(
+        f"\n### {npc.get('name', '')}（{npc.get('role', '')}）{marker}"
+        f"\n- id：`{npc.get('id', '')}`（写 speaker_id 时必须用这个值）"
+    )
 
     if npc.get("age"):
         lines.append(f"- 年龄：{npc['age']}")
@@ -577,6 +626,79 @@ def parse_ai_response(raw: str) -> dict[str, Any]:
         raise ValueError(f"AI 返回了无法解析的 JSON: {text[:200]}") from e
 
 
+# ── 台词归一化 ────────────────────────────────────
+#
+# 输出契约从「单个 npc 对象」改成「lines 数组」，但模型不总是听话：
+# 它可能仍然返回旧的 npc 字段，也可能把 lines 写成字符串、
+# 写成单个对象、或者只写 speaker_name 不写 speaker_id。
+# 这里统一收口成 list[dict]，让下游只需处理一种形状。
+
+MAX_LINES = 3
+
+
+def normalize_lines(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """把 AI 响应里的台词统一成 `lines` 数组。
+
+    优先级：`lines` 数组 > `lines` 单对象 > 旧的 `npc` 对象。
+    结果至少 1 项（AI 完全没给台词时补一句占位，避免下游拿到空数组）。
+    """
+    raw_lines: Any = payload.get("lines")
+
+    if isinstance(raw_lines, dict):
+        raw_lines = [raw_lines]
+    if not isinstance(raw_lines, list):
+        raw_lines = []
+
+    # 旧格式兼容：只有 npc 没有 lines
+    if not raw_lines:
+        legacy = payload.get("npc")
+        if isinstance(legacy, dict) and legacy:
+            raw_lines = [legacy]
+
+    cleaned: list[dict[str, str]] = []
+    for item in raw_lines:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue  # 空台词不算一句话
+        cleaned.append(
+            {
+                "speaker_id": str(item.get("speaker_id") or "").strip(),
+                "speaker_name": str(item.get("speaker_name") or "").strip(),
+                "content": content,
+                "reply_to": str(item.get("reply_to") or "player").strip(),
+            }
+        )
+        if len(cleaned) >= MAX_LINES:
+            break
+
+    if not cleaned:
+        cleaned = [
+            {
+                "speaker_id": "unknown",
+                "speaker_name": "???",
+                "content": "...",
+                "reply_to": "player",
+            }
+        ]
+
+    # 第 1 句必须回应玩家：模型偶尔会把它写成对某个 NPC 说。
+    # 不改这一句的内容，只把 reply_to 拉回来——否则前端会以为
+    # 玩家这回合没人搭理。
+    cleaned[0]["reply_to"] = "player"
+
+    return cleaned
+
+
+def apply_lines(payload: dict[str, Any]) -> dict[str, Any]:
+    """归一化 lines，并同步 `npc` 为 lines[0] 以兼容旧前端/测试。"""
+    lines = normalize_lines(payload)
+    payload["lines"] = lines
+    payload["npc"] = dict(lines[0])
+    return payload
+
+
 # ── 套话检测（设计文档 6.2）─────────────────────
 #
 # 注意：最初只写了完整短语（如「空气中弥漫着」），实测发现 AI 会绕开——
@@ -679,9 +801,7 @@ async def generate_turn(
     result = parse_ai_response(raw)
 
     result.setdefault("narration", {"en": "", "zh": ""})
-    result.setdefault(
-        "npc", {"speaker_id": "unknown", "speaker_name": "???", "content": "..."}
-    )
+    result = apply_lines(result)
     result.setdefault("feedback", None)
     result.setdefault("world_changes", {})
 
@@ -720,9 +840,7 @@ async def generate_opening(
     result = parse_ai_response(raw)
 
     result.setdefault("narration", {"en": "", "zh": ""})
-    result.setdefault(
-        "npc", {"speaker_id": "unknown", "speaker_name": "???", "content": "..."}
-    )
+    result = apply_lines(result)
     result["feedback"] = None
     result.setdefault("world_changes", {})
 

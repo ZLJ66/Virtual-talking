@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from ai_engine import generate_turn, generate_opening
 from mainline import judge as judge_changes
@@ -160,10 +160,29 @@ class TurnResponse(BaseModel):
     """AI 生成的回合响应"""
 
     narration: dict[str, str]  # {"en": ..., "zh": ...}
-    npc: dict[str, str]        # {"speaker_id": ..., "speaker_name": ..., "content": ...}
+    # lines: 本回合的所有台词，按说话顺序。1~3 项。
+    # 大多数回合只有 1 项；玩家同时对多人说话、或有人插话时才会多项。
+    lines: list[dict[str, str]] = []
+    # npc: 兼容字段，恒等于 lines[0]。旧前端/测试仍可用。
+    # 有默认值，因为新代码可以只传 lines，由校验器回填。
+    npc: dict[str, str] = {}
     feedback: dict | None = None
     completes_scene: bool = False
     world_changes: dict = {}
+
+    @model_validator(mode="after")
+    def _sync_lines_and_npc(self) -> "TurnResponse":
+        """保证 lines 与 npc 双向一致。
+
+        ai_engine.apply_lines 已经做过一次归一化，这里是最后一道闸：
+        任何直接构造 TurnResponse 的调用方（测试、旧代码）都不会漏掉其中一边。
+        契约是「npc 恒等于 lines[0]」，所以有 lines 时一律以 lines[0] 为准。
+        """
+        if self.lines:
+            self.npc = dict(self.lines[0])
+        elif self.npc:
+            self.lines = [dict(self.npc)]
+        return self
 
 
 class ErrorResponse(BaseModel):
@@ -391,16 +410,24 @@ class WaitRequest(BaseModel):
     """原地等待请求"""
 
     player_state: dict[str, Any]
+    # 一次等待推进几个时段。默认 1（「等一会儿」）。
+    # 设为足够大就是「睡一觉」：夜里一次推进到次日早晨。
+    slots: int = Field(default=1, ge=1, le=6)
 
 
 @app.post("/api/wait", response_model=MoveResponse)
 async def api_wait(req: WaitRequest):
     """
-    原地等待：消耗 1 个时段，世界推进一拍。
+    原地等待：消耗时段，世界推进。
 
     设计依据：《世界层设计.md》4.6
     "等待不是空转，是给世界一个机会。"
     没有它，玩家在错误时段到达某地只能靠来回移动刷时间。
+
+    slots=1 是「等一会儿」；slots 大到跨日就是「睡一觉」。
+    早期版本只支持 1 个时段，玩家要从第 1 天早晨走到第 2 天早晨
+    得连按 6 次，且每次只说「上午过去了」——没有人能想到这是通往
+    第二天的路。夜里给一个「睡觉」按钮比加提示更直接。
     """
     content = _require_world()
     world = content.world
@@ -412,10 +439,26 @@ async def api_wait(req: WaitRequest):
 
     old_time = state.time
     new_state = state.model_copy(deep=True)
-    new_state.time = old_time.advance(1)
+    new_state.time = old_time.advance(req.slots)
 
-    if old_time.day != new_state.time.day:
-        narration = f"你在原地待了很久，再抬头时天已经亮了——第 {new_state.time.day} 天。"
+    day_passed = new_state.time.day - old_time.day
+
+    if day_passed > 0:
+        if day_passed == 1:
+            narration = (
+                f"你睡了一觉，醒来时窗外已经亮了——第 {new_state.time.day} 天，"
+                f"{new_state.time.slot.label_zh}。"
+            )
+        else:
+            narration = (
+                f"时间过去了 {day_passed} 天，再抬头时是第 "
+                f"{new_state.time.day} 天的{new_state.time.slot.label_zh}。"
+            )
+    elif req.slots > 1:
+        narration = (
+            f"你待了 {req.slots} 个时段，"
+            f"现在是{new_state.time.slot.label_zh}。"
+        )
     else:
         slot_phrase = {
             "morning": "天光一点点亮起来",

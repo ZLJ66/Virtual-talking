@@ -37,12 +37,19 @@ export async function fetchMove(
   return res.json() as Promise<MoveResult>
 }
 
-/** 原地等待：消耗 1 个时段，世界推进一拍 */
-export async function fetchWait(playerState: PlayerState): Promise<MoveResult> {
+/**
+ * 原地等待：消耗时段，世界推进。
+ *
+ * slots=1 是「等一会儿」；大到跨日就是「睡一觉」。
+ */
+export async function fetchWait(
+  playerState: PlayerState,
+  slots = 1,
+): Promise<MoveResult> {
   const res = await fetch(`${API_BASE}/api/wait`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ player_state: playerState }),
+    body: JSON.stringify({ player_state: playerState, slots }),
   })
   if (!res.ok) {
     const err = await res.text()

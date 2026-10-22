@@ -27,6 +27,24 @@ export function ActionBar() {
   const destinations =
     world?.locations.filter((l) => currentLoc?.connections.includes(l.id)) ?? []
 
+  // 距次日早晨还差几个时段。
+  //
+  // 为什么需要它：从第 1 天早晨走到第 2 天早晨要推进 6 个时段，
+  // 而每次「等一会儿」只说「上午过去了」——实测玩家根本想不到
+  // 那是通往第二天的路，卡在第 1 天出不去。
+  // 光加提示不够，夜里必须给一个叫「睡觉」的按钮。
+  const SLOT_ORDER = [
+    'morning',
+    'forenoon',
+    'noon',
+    'afternoon',
+    'evening',
+    'night',
+  ] as const
+  const slotIndex = player ? SLOT_ORDER.indexOf(player.time.slot as (typeof SLOT_ORDER)[number]) : -1
+  const slotsToNextDay = slotIndex >= 0 ? SLOT_ORDER.length - slotIndex : 0
+  const isNight = player?.time.slot === 'night'
+
   // 全局键盘快捷键：仅在按钮可用时触发
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -109,12 +127,16 @@ export function ActionBar() {
         </button>
         <button
           type="button"
-          className="action-btn"
-          onClick={() => void waitHere()}
+          className={`action-btn ${isNight ? 'primary' : ''}`}
+          onClick={() => void waitHere(isNight ? slotsToNextDay : 1)}
           disabled={moving}
-          title="在原地等一会儿，时间会推进一个时段"
+          title={
+            isNight
+              ? '睡一觉，直接到第二天早上'
+              : `在原地等一会儿，时间推进一个时段（距第二天还有 ${slotsToNextDay} 个时段）`
+          }
         >
-          ⏳ 等一会儿
+          {isNight ? '🌙 睡觉' : '⏳ 等一会儿'}
         </button>
       </div>
 
@@ -173,6 +195,9 @@ export function ActionBar() {
           </ul>
           <p className="destination-hint">
             移动会消耗时间（对话不消耗）。现在是{player.time.slot && TIME_SLOT_LABELS_ZH[player.time.slot]}。
+            {slotsToNextDay > 0 && (
+              <>距第二天还有 {slotsToNextDay} 个时段，夜里可以「睡觉」直接到次日早晨。</>
+            )}
           </p>
         </div>
       )}

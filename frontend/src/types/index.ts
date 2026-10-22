@@ -79,6 +79,17 @@ export interface DialogueDisplay {
   status: DialogueStatus
   /** 请求重复的令牌：每次请求重复时自增，组件据此重置打字进度 */
   repeatToken: number
+  /**
+   * 待播的后续台词。
+   *
+   * 一个回合可能有 1~3 句台词（多人同场时 A 说一句、B 插一句）。
+   * 若一次性全部追加到事件流，它们会同时出现，等于把对话变成一段剧本，
+   * 玩家还没读完就已经被打断了。所以后续台词先留在这里排队，
+   * 当前这句打完（DIALOGUE_DONE）再把队首追加进事件流。
+   *
+   * 存完整事件而不只是 id，是因为这些事件还没进 state.events。
+   */
+  queue: Extract<GameEvent, { kind: 'npc_dialogue' }>[]
 }
 
 /* ----------------------------- 全局游戏状态 ----------------------------- */
