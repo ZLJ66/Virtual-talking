@@ -137,6 +137,7 @@ export type GameAction =
   | { type: 'JUDGE_FAILED' }
   | { type: 'AI_OPENING_SUCCESS'; result: AIOpeningResponse; locationId: string }
   | { type: 'AI_OPENING_ERROR'; error: string }
+  | { type: 'AI_OPENING_SKIP' }
   | { type: 'DIALOGUE_DONE' }
   | { type: 'INTERRUPT' }
   | { type: 'PAUSE' }
@@ -334,8 +335,11 @@ function reducer(state: GameState, action: GameAction): GameState {
         mainlineLines: r.mainline_lines ?? state.mainlineLines,
         progress: r.progress ?? state.progress,
         dialogue: { eventId: null, status: 'idle', repeatToken: 0, queue: [] },
-        awaitingInput: false,
-        // 第 4 次及以后进入不再调用 AI（成本控制，设计文档 5.5）
+        // 第 4 次及以后进入不再调用 AI（成本控制，设计文档 5.5）。
+        // 那种情况没有开场要等，必须立刻把输入权交还玩家——
+        // 否则 aiLoading 是 false、awaitingInput 也是 false，
+        // 没有任何 effect 会再来改动它们，输入框就永久禁用。
+        awaitingInput: visits >= 4,
         aiLoading: visits < 4,
       }
     }
@@ -522,6 +526,12 @@ function reducer(state: GameState, action: GameAction): GameState {
         awaitingInput: true,
       }
 
+    case 'AI_OPENING_SKIP':
+      // 兜底：aiLoading 被置起，但这次进入不该/不能调 AI（没找到地点等）。
+      // 不加这个分支的话，aiLoading 永远停在 true，玩家永久卡在
+      // 「AI 正在构思」。宁可少一次开场，也不能让界面死住。
+      return { ...state, aiLoading: false, awaitingInput: true }
+
     case 'CLEAR_ERROR':
       return { ...state, aiError: null, moveError: null, worldError: null }
 
@@ -603,7 +613,12 @@ const GameContext = createContext<GameContextValue | null>(null)
 export function GameProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, initialState)
 
-  // 已请求过 AI 开场的地点集合，防止重复触发
+  // 已请求过 AI 开场的「地点 + 第几次进入」，防止重复触发。
+  //
+  // 键里必须带进入次数。以前只按地点 id 去重，于是「回宿舍」这类再进入
+  // 永远命中缓存直接 return——可 MOVE_SUCCESS 已经把 aiLoading 置成 true，
+  // 没有任何人再把它放下来，玩家就永久停在「AI 正在构思」：
+  // 输入框禁用、awaitingInput 为 false，只能刷新页面。
   const openingRequestedRef = useRef<Set<string>>(new Set())
   // 已请求过 AI 回合的事件 id
   const turnRequestedRef = useRef<Set<string>>(new Set())
@@ -695,13 +710,22 @@ export function GameProvider({ children }: { children: ReactNode }) {
     if (!state.aiLoading || !state.world || !state.player || !state.profile) return
 
     const locationId = state.player.location
-    if (openingRequestedRef.current.has(locationId)) return
-    openingRequestedRef.current.add(locationId)
+    // 用「地点 + 进入次数」做键：同一个地点第 2 次进入也要能再生成开场，
+    // 否则 aiLoading 会被置起后无人清除（见 openingRequestedRef 的注释）。
+    const requestKey = `${locationId}#${state.player.visit_counts[locationId] ?? 1}`
+    if (openingRequestedRef.current.has(requestKey)) return
+    openingRequestedRef.current.add(requestKey)
 
     const loc = state.world.locations.find((l) => l.id === locationId)
-    if (!loc) return
+    if (!loc) {
+      // 世界数据里没有这个地点（内容改了、状态旧了）：没有开场可生成。
+      // 必须显式放开输入，否则 aiLoading 永远为 true。
+      dispatch({ type: 'AI_OPENING_SKIP' })
+      return
+    }
 
     let cancelled = false
+    let settled = false
     // 传入全部 NPC：开场也要知道同行者一起进来了
     fetchOpening(
       loc,
@@ -713,14 +737,20 @@ export function GameProvider({ children }: { children: ReactNode }) {
       state.mainlineLines,
     )
       .then((result) => {
+        settled = true
         if (!cancelled) dispatch({ type: 'AI_OPENING_SUCCESS', result, locationId })
       })
       .catch((err) => {
+        settled = true
         if (!cancelled) dispatch({ type: 'AI_OPENING_ERROR', error: (err as Error).message })
       })
 
     return () => {
       cancelled = true
+      // 请求还没回来就被清理（依赖变化、组件重挂）时，把去重标记撤回，
+      // 让下一次渲染能重新发起。否则结果被丢弃、标记却还在，
+      // aiLoading 永远为 true，又是一次「AI 正在构思」死锁。
+      if (!settled) openingRequestedRef.current.delete(requestKey)
     }
   }, [state.aiLoading, state.player, state.world, state.profile, state.events])
 
@@ -735,9 +765,14 @@ export function GameProvider({ children }: { children: ReactNode }) {
 
     const player = state.player
     const loc = state.world.locations.find((l) => l.id === player.location)
-    if (!loc) return
+    if (!loc) {
+      // 同上：没有地点就没法生成回合，必须放开输入而不是干等
+      dispatch({ type: 'AI_TURN_ERROR', error: '当前地点不在世界数据中' })
+      return
+    }
 
     let cancelled = false
+    let settled = false
     // 传入全部 NPC：在场者由 buildPresentNPCs 依据「常驻 + 同行」组装
     fetchTurn(
       loc,
@@ -750,14 +785,17 @@ export function GameProvider({ children }: { children: ReactNode }) {
       state.mainlineLines,
     )
       .then((result) => {
+        settled = true
         if (!cancelled) dispatch({ type: 'AI_TURN_SUCCESS', result })
       })
       .catch((err) => {
+        settled = true
         if (!cancelled) dispatch({ type: 'AI_TURN_ERROR', error: (err as Error).message })
       })
 
     return () => {
       cancelled = true
+      if (!settled) turnRequestedRef.current.delete(last.id)
     }
   }, [state.aiLoading, state.events, state.player, state.world, state.profile])
 
